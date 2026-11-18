@@ -15,6 +15,7 @@
 //! - Every offset in an answer is UTF-16, as the contract says; ast-grep's
 //!   are bytes.
 
+use super::files::Cancel;
 use super::types::{FileMatch, KitError, MatchLine, Range, StructuralLang};
 use ast_grep_core::tree_sitter::StrDoc;
 use ast_grep_core::{AstGrep, Language, Node, Pattern};
@@ -97,6 +98,8 @@ pub fn search_structural(
         return Ok(Vec::new());
     }
     let started = Instant::now();
+    // Set when `lwk serve`'s caller cancelled the search.
+    let cancel = Cancel::current();
     let max_files = max_files.min(super::types::SEARCH_STRUCTURAL_LIMIT.max);
 
     let langs: Vec<StructuralLang> = match lang {
@@ -105,7 +108,7 @@ pub fn search_structural(
     };
     let specs: Vec<LangSpec> = langs.iter().map(|lang| spec_of(*lang)).collect();
 
-    let mut files = list_files(root, &specs, started)?;
+    let mut files = list_files(root, &specs, started, &cancel)?;
     files.sort_by(|a, b| a.path.cmp(&b.path));
 
     // Only the languages there are files for are checked, and kept when the
@@ -140,11 +143,14 @@ pub fn search_structural(
     let mut matches = 0usize;
     let mut timed_out = false;
     'outer: for batch in files.chunks(BATCH) {
+        if cancel.is_set() {
+            return Err(Cancel::error());
+        }
         if started.elapsed() >= TIMEOUT {
             timed_out = true;
             break;
         }
-        let results = match_batch(root, batch, &specs, &patterns, word.as_deref());
+        let results = match_batch(root, batch, &specs, &patterns, word.as_deref(), &cancel);
         for mut result in results.into_iter().flatten() {
             if found.len() >= max_files {
                 if let Some(last) = found.last_mut() {
@@ -186,10 +192,18 @@ struct Candidate {
 
 /// The files under `root` that ripgrep would search, kept to the specs'
 /// extensions; symlinks and files over 1 MB left out.
-fn list_files(root: &Path, specs: &[LangSpec], started: Instant) -> Result<Vec<Candidate>, KitError> {
+fn list_files(
+    root: &Path,
+    specs: &[LangSpec],
+    started: Instant,
+    cancel: &Cancel,
+) -> Result<Vec<Candidate>, KitError> {
     let walk = WalkBuilder::new(root).follow_links(false).build();
     let mut files = Vec::new();
     for entry in walk {
+        if cancel.is_set() {
+            return Err(Cancel::error());
+        }
         if started.elapsed() >= TIMEOUT {
             return Err(KitError::timeout());
         }
@@ -300,6 +314,7 @@ fn match_batch(
     specs: &[LangSpec],
     patterns: &[Option<Pattern>],
     word: Option<&str>,
+    cancel: &Cancel,
 ) -> Vec<Option<FileMatch>> {
     let slots: Vec<Mutex<Option<FileMatch>>> = batch.iter().map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
@@ -309,6 +324,10 @@ fn match_batch(
     let work = || loop {
         let at = next.fetch_add(1, Ordering::Relaxed);
         let Some(file) = batch.get(at) else { break };
+        // Cancelled: the rest of the batch is left unread, its answer unsent.
+        if cancel.is_set() {
+            break;
+        }
         let Some(pattern) = patterns[file.spec].as_ref() else {
             continue;
         };

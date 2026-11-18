@@ -16,8 +16,9 @@
 //! listing keeps the first `limit` files in path order, every time.
 
 use super::cache;
-use super::types::{FileListing, KitError};
+use super::types::{FileListing, KitError, KitErrorCode};
 use ignore::{DirEntry, ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState};
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::path::Path;
@@ -30,6 +31,53 @@ pub(crate) const WALK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How many files a walking thread gathers before it tells the others.
 const BATCH: usize = 64;
+
+// ── Cancelling (`lwk serve`) ────────────────────────────────────────────────
+
+thread_local! {
+    /// The cancel flag of the call this thread runs; None outside `lwk serve`.
+    static CANCEL: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+}
+
+/// Whether the caller cancelled the call a walk or search works for.
+///
+/// - Taken with [`Cancel::current`] on the thread the call runs on, then
+///   read from the walking threads.
+/// - Never set unless the call runs inside [`Cancel::scope`], which only
+///   `lwk serve` does: for `lwk` and `lwk mcp` it is always false.
+/// - A cancelled walk stops as one out of time does; what it answers is
+///   not sent.
+#[derive(Clone, Default)]
+pub(crate) struct Cancel(Option<Arc<AtomicBool>>);
+
+impl Cancel {
+    /// The flag of the call this thread runs.
+    pub(crate) fn current() -> Cancel {
+        Cancel(CANCEL.with(|flag| flag.borrow().clone()))
+    }
+
+    pub(crate) fn is_set(&self) -> bool {
+        self.0.as_ref().is_some_and(|flag| flag.load(Atomic::Relaxed))
+    }
+
+    /// Run `call` with `flag` as this thread's cancel flag.
+    pub(crate) fn scope<T>(flag: Arc<AtomicBool>, call: impl FnOnce() -> T) -> T {
+        struct Restore(Option<Arc<AtomicBool>>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let before = self.0.take();
+                CANCEL.with(|flag| *flag.borrow_mut() = before);
+            }
+        }
+        let _restore = Restore(CANCEL.with(|at| at.borrow_mut().replace(flag)));
+        call()
+    }
+
+    /// The error a cancelled call fails with.
+    pub(crate) fn error() -> KitError {
+        KitError::new(KitErrorCode::Cancelled, "Cancelled.")
+    }
+}
 
 /// The files under `root`, `.gitignore` respected, sorted.
 ///
@@ -80,6 +128,7 @@ fn list_files_uncached(root: &Path, max_files: usize) -> Result<FileListing, Kit
         root,
         max_files,
         deadline: Instant::now() + WALK_TIMEOUT,
+        cancel: Cancel::current(),
         timed_out: AtomicBool::new(false),
         seen: AtomicUsize::new(0),
         best: Mutex::new(BinaryHeap::new()),
@@ -104,6 +153,7 @@ struct ListShared<'a> {
     root: &'a Path,
     max_files: usize,
     deadline: Instant,
+    cancel: Cancel,
     timed_out: AtomicBool,
     /// Every file seen, kept or not.
     seen: AtomicUsize,
@@ -174,7 +224,7 @@ impl Lister<'_> {
 impl ParallelVisitor for Lister<'_> {
     fn visit(&mut self, entry: Result<DirEntry, ignore::Error>) -> WalkState {
         let shared = self.shared;
-        if Instant::now() >= shared.deadline {
+        if Instant::now() >= shared.deadline || shared.cancel.is_set() {
             shared.timed_out.store(true, Atomic::Relaxed);
             return WalkState::Quit;
         }

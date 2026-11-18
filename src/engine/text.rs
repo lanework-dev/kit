@@ -118,6 +118,8 @@ struct Shared<'a> {
     matcher: &'a RegexMatcher,
     max_files: usize,
     deadline: Instant,
+    /// Set when `lwk serve`'s caller cancelled the search.
+    cancel: files::Cancel,
     timed_out: AtomicBool,
     /// The files found so far up to the cutoff, by walk key, with their
     /// number of lines.
@@ -166,6 +168,7 @@ fn search_all(
         matcher,
         max_files,
         deadline,
+        cancel: files::Cancel::current(),
         timed_out: AtomicBool::new(false),
         settled: Mutex::new(BTreeMap::new()),
         cutoff: Cutoff::default(),
@@ -206,7 +209,7 @@ struct Worker<'a> {
 impl ParallelVisitor for Worker<'_> {
     fn visit(&mut self, entry: Result<DirEntry, ignore::Error>) -> WalkState {
         let shared = self.shared;
-        if Instant::now() >= shared.deadline {
+        if Instant::now() >= shared.deadline || shared.cancel.is_set() {
             shared.timed_out.store(true, Ordering::Relaxed);
             return WalkState::Quit;
         }

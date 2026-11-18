@@ -50,11 +50,11 @@
 
 use super::files;
 use ignore::{DirEntry, ParallelVisitor, ParallelVisitorBuilder, WalkState};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAGIC: &[u8; 8] = b"LWKFILES";
@@ -78,7 +78,322 @@ pub(crate) struct Listing {
 /// is off for `root` and the caller walks it uncached.
 pub(crate) fn listing(root: &Path) -> Option<Listing> {
     let settings = settings()?;
-    listing_with(root, &settings).map(|(listing, _)| listing)
+    let found = match RAM.get() {
+        Some(ram) => ram.listing_with(root, &settings),
+        None => listing_with(root, &settings),
+    };
+    found.map(|(listing, _)| listing)
+}
+
+// ── Kept in RAM (`lwk serve`) ───────────────────────────────────────────────
+
+/// How long a folder's files stay in RAM unused.
+const RAM_UNUSED_FOR: Duration = Duration::from_secs(600);
+
+/// The caches a long-lived process keeps; unset in `lwk` and `lwk mcp`.
+static RAM: OnceLock<Ram> = OnceLock::new();
+
+/// From now on, keep the caches of the `capacity` roots used last in this
+/// process's memory, so a call need not read and parse the cache file.
+///
+/// - Each call still checks the cache as [`listing_with`] does (every
+///   folder and ignore source stat'ed) and answers the same files.
+/// - Inside [`checked_meanwhile`] that check runs while the caller already
+///   works on the files held; the caller then learns whether they held.
+/// - The cache file is read when a root is not in memory, and written
+///   whenever the check finds a change: another `lwk` starts warm.
+/// - `LWK_NO_CACHE=1` turns this off with the rest.
+pub(crate) fn keep_in_ram(capacity: usize) {
+    let _ = RAM.set(Ram::new(capacity));
+}
+
+thread_local! {
+    /// Inside [`checked_meanwhile`]: the checks of the listings this
+    /// thread was given before their check ended.
+    static AHEAD: std::cell::RefCell<Option<Vec<Arc<Check>>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `call`, a kit call on this thread, giving it the files held in
+/// memory at once while their check (the same one) runs on other threads.
+/// Returns its answer and whether every listing it was given that way held:
+/// when false, a folder or ignore source changed, the answer is not to be
+/// used, and the call is run again outside this, where the check comes
+/// first.
+///
+/// Nothing is given ahead unless [`keep_in_ram`] is on.
+pub(crate) fn checked_meanwhile<T>(call: impl FnOnce() -> T) -> (T, bool) {
+    AHEAD.with(|ahead| *ahead.borrow_mut() = Some(Vec::new()));
+    let answer = call();
+    let checks = AHEAD.with(|ahead| ahead.borrow_mut().take()).unwrap_or_default();
+    // Every check is waited for, so none is left running.
+    let mut held = true;
+    for check in &checks {
+        held &= check.finish();
+    }
+    (answer, held)
+}
+
+struct Ram {
+    capacity: usize,
+    roots: Mutex<Vec<Kept>>,
+    crew: Arc<Crew>,
+}
+
+struct Kept {
+    root: PathBuf,
+    used: Instant,
+    /// Locked for the whole of a call's check: two calls on one root check
+    /// one after the other. None until a walk ends whole.
+    held: Arc<Mutex<Option<Held>>>,
+}
+
+/// A cache held in memory, with what its check needs made once.
+struct Held {
+    cache: Cache,
+    /// Each of `cache.folders`, as a path and as it was when listed.
+    folders: Arc<Vec<(PathBuf, FolderStat)>>,
+    /// Every ignore source: `cache.sources` and the folders' marks.
+    sources: Arc<Vec<Source>>,
+}
+
+impl Held {
+    fn new(root: &Path, cache: Cache) -> Held {
+        let folders = cache
+            .folders
+            .iter()
+            .map(|folder| (join_rel(root, &folder.rel), folder.stat))
+            .collect();
+        let marks = cache.folders.iter().flat_map(|folder| folder.marks.iter());
+        let sources = cache.sources.iter().chain(marks).cloned().collect();
+        Held {
+            cache,
+            folders: Arc::new(folders),
+            sources: Arc::new(sources),
+        }
+    }
+
+    /// Whether this is `root`'s cache as this process walks it now, with
+    /// the root folder first as [`update`] needs it.
+    fn usable(&self, root_bytes: &[u8], env: &[u8]) -> bool {
+        let cache = &self.cache;
+        cache.root == root_bytes
+            && cache.env == env
+            && cache.folders.first().is_some_and(|root| root.rel.is_empty())
+    }
+}
+
+/// Threads that stat a held cache's folders, kept for the process's life:
+/// a check takes about the time the stats do, with none spent starting
+/// threads, and can run while its caller does something else.
+struct Crew {
+    checks: Mutex<VecDeque<Arc<Check>>>,
+    ready: Condvar,
+    helpers: usize,
+}
+
+/// Whether [`update`] would find a held cache unchanged (`Unchanged`): no
+/// ignore source stale, and every folder there with the stat it had, none
+/// of them racy. The same stats, read the same way, without the tables an
+/// update needs; shared by the threads working on it.
+struct Check {
+    folders: Arc<Vec<(PathBuf, FolderStat)>>,
+    sources: Arc<Vec<Source>>,
+    /// The racy line of the walk that recorded them.
+    then: i64,
+    /// The next part no thread took yet.
+    next: AtomicUsize,
+    changed: AtomicBool,
+    /// Parts done.
+    done: Mutex<usize>,
+    all_done: Condvar,
+}
+
+/// Folders a thread stats before it takes more.
+const CHECK_PART: usize = 64;
+
+impl Check {
+    /// The sources are part 0, the folders the parts after.
+    fn parts(&self) -> usize {
+        1 + self.folders.len().div_ceil(CHECK_PART)
+    }
+
+    fn part_as_it_was(&self, part: usize) -> bool {
+        if part == 0 {
+            return !self.sources.iter().any(|source| source.stale(self.then));
+        }
+        let from = (part - 1) * CHECK_PART;
+        let to = self.folders.len().min(from + CHECK_PART);
+        self.folders[from..to]
+            .iter()
+            .all(|(path, stat)| FolderStat::at(path) == Some(*stat) && !stat.racy(self.then))
+    }
+
+    /// Take parts until none is left. Once something changed the rest is
+    /// not read: the update that follows stats it all.
+    fn work(&self) {
+        loop {
+            let part = self.next.fetch_add(1, Ordering::Relaxed);
+            if part >= self.parts() {
+                return;
+            }
+            if !self.changed.load(Ordering::Relaxed) && !self.part_as_it_was(part) {
+                self.changed.store(true, Ordering::Relaxed);
+            }
+            let mut done = self.done.lock().unwrap_or_else(|e| e.into_inner());
+            *done += 1;
+            if *done >= self.parts() {
+                self.all_done.notify_all();
+            }
+        }
+    }
+
+    /// Help with what is left, wait for the rest, and say whether nothing
+    /// changed.
+    fn finish(&self) -> bool {
+        self.work();
+        // A helper may still be on the part it took.
+        let mut done = self.done.lock().unwrap_or_else(|e| e.into_inner());
+        while *done < self.parts() {
+            done = self.all_done.wait(done).unwrap_or_else(|e| e.into_inner());
+        }
+        !self.changed.load(Ordering::Relaxed)
+    }
+}
+
+impl Crew {
+    fn new() -> Arc<Crew> {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        // More than four threads stat no faster.
+        let helpers = if cores > 1 { cores.min(4) } else { 0 };
+        let crew = Arc::new(Crew {
+            checks: Mutex::new(VecDeque::new()),
+            ready: Condvar::new(),
+            helpers,
+        });
+        let mut started = 0;
+        for at in 0..helpers {
+            let helper = crew.clone();
+            let spawned = std::thread::Builder::new()
+                .name(format!("lwk-stat-{at}"))
+                .spawn(move || helper.help());
+            started += usize::from(spawned.is_ok());
+        }
+        if started == helpers {
+            return crew;
+        }
+        // Whoever asks for a check does it all; a helper that did start
+        // finds nothing to do.
+        Arc::new(Crew {
+            checks: Mutex::new(VecDeque::new()),
+            ready: Condvar::new(),
+            helpers: 0,
+        })
+    }
+
+    fn help(&self) {
+        loop {
+            let check = {
+                let mut checks = self.checks.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    match checks.pop_front() {
+                        Some(check) => break check,
+                        None => checks = self.ready.wait(checks).unwrap_or_else(|e| e.into_inner()),
+                    }
+                }
+            };
+            check.work();
+        }
+    }
+
+    /// Start checking `held` on the helpers; [`Check::finish`] ends it.
+    fn start(&self, held: &Held) -> Arc<Check> {
+        let check = Arc::new(Check {
+            folders: held.folders.clone(),
+            sources: held.sources.clone(),
+            then: held.cache.stamp,
+            next: AtomicUsize::new(0),
+            changed: AtomicBool::new(false),
+            done: Mutex::new(0),
+            all_done: Condvar::new(),
+        });
+        let helpers = self.helpers.min(check.parts());
+        if helpers > 0 {
+            let mut checks = self.checks.lock().unwrap_or_else(|e| e.into_inner());
+            checks.extend((0..helpers).map(|_| check.clone()));
+            drop(checks);
+            self.ready.notify_all();
+        }
+        check
+    }
+}
+
+impl Ram {
+    fn new(capacity: usize) -> Ram {
+        Ram {
+            capacity: capacity.max(1),
+            roots: Mutex::new(Vec::new()),
+            crew: Crew::new(),
+        }
+    }
+
+    /// `root`'s place, made if need be; the root unused the longest goes
+    /// when there are too many, and any unused for [`RAM_UNUSED_FOR`].
+    fn place(&self, root: &Path) -> Arc<Mutex<Option<Held>>> {
+        let now = Instant::now();
+        let mut roots = self.roots.lock().unwrap_or_else(|e| e.into_inner());
+        roots.retain(|kept| now.duration_since(kept.used) < RAM_UNUSED_FOR);
+        if let Some(kept) = roots.iter_mut().find(|kept| kept.root == root) {
+            kept.used = now;
+            return kept.held.clone();
+        }
+        if roots.len() >= self.capacity {
+            let oldest = roots.iter().enumerate().min_by_key(|(_, kept)| kept.used);
+            if let Some((at, _)) = oldest {
+                roots.swap_remove(at);
+            }
+        }
+        let held = Arc::new(Mutex::new(None));
+        roots.push(Kept {
+            root: root.to_path_buf(),
+            used: now,
+            held: held.clone(),
+        });
+        held
+    }
+
+    /// [`listing_with`], from the cache held for `root` when there is one.
+    fn listing_with(&self, root: &Path, settings: &Settings) -> Option<(Listing, Outcome)> {
+        let files = |cache: &Cache| cache.files.iter().map(|file| file.path.clone()).collect();
+        let place = self.place(root);
+        let mut held = place.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(kept) = held.as_ref().filter(|kept| kept.usable(bytes_of(root.as_os_str()), &env_key())) {
+            let check = self.crew.start(kept);
+            // Inside `checked_meanwhile` the caller goes on with these
+            // files and hears of the check there.
+            let ahead = AHEAD.with(|ahead| {
+                let mut ahead = ahead.borrow_mut();
+                ahead.as_mut().map(|checks| checks.push(check.clone())).is_some()
+            });
+            let listing = Listing {
+                files: files(&kept.cache),
+                complete: true,
+            };
+            if ahead || check.finish() {
+                return Some((listing, Outcome::Hit));
+            }
+        }
+        let old = held.take().map(|kept| kept.cache);
+        let (cache, outcome) = refresh(root, settings, old)?;
+        let listing = Listing {
+            files: files(&cache),
+            complete: outcome != Outcome::Partial,
+        };
+        // A walk cut short is not the folder's files: not kept.
+        if listing.complete {
+            *held = Some(Held::new(root, cache));
+        }
+        Some((listing, outcome))
+    }
 }
 
 // ── Settings ────────────────────────────────────────────────────────────────
@@ -149,6 +464,16 @@ pub(crate) enum Outcome {
 }
 
 pub(crate) fn listing_with(root: &Path, settings: &Settings) -> Option<(Listing, Outcome)> {
+    let (cache, outcome) = refresh(root, settings, None)?;
+    let complete = outcome != Outcome::Partial;
+    let files = cache.files.into_iter().map(|file| file.path).collect();
+    Some((Listing { files, complete }, outcome))
+}
+
+/// `root`'s cache brought up to date, and what that took: `held` (the one
+/// a long-lived process kept) when it is this root's, else the cache file.
+/// None when the cache is off for `root`.
+fn refresh(root: &Path, settings: &Settings, held: Option<Cache>) -> Option<(Cache, Outcome)> {
     if !cfg!(unix) || too_broad(root) {
         return None;
     }
@@ -159,7 +484,11 @@ pub(crate) fn listing_with(root: &Path, settings: &Settings) -> Option<(Listing,
     let env = env_key();
     let root_bytes = bytes_of(root.as_os_str()).to_vec();
 
-    let old = std::fs::read(&file).ok().and_then(|bytes| decode(&bytes));
+    let held = held.filter(|cache| cache.root == root_bytes && cache.env == env);
+    let old = match held {
+        Some(cache) => Some(Stored::Cache(cache)),
+        None => std::fs::read(&file).ok().and_then(|bytes| decode(&bytes)),
+    };
     let old = match old {
         Some(Stored::Skip(skip)) if skip.root == root_bytes && skip.env == env => {
             if nanos(start) < skip.until {
@@ -194,9 +523,7 @@ pub(crate) fn listing_with(root: &Path, settings: &Settings) -> Option<(Listing,
             }
         }
     };
-    let complete = outcome != Outcome::Partial;
-    let files = cache.files.into_iter().map(|file| file.path).collect();
-    Some((Listing { files, complete }, outcome))
+    Some((cache, outcome))
 }
 
 /// `/` and the home folder are never cached (scope refuses them too).
@@ -580,6 +907,9 @@ struct Gather<'s> {
     root: &'s Path,
     shallow: bool,
     deadline: Instant,
+    /// Set when `lwk serve`'s caller cancelled the call; the walk then
+    /// stops as one out of time does, and nothing is written.
+    cancel: files::Cancel,
     max_files: usize,
     timed_out: &'s AtomicBool,
     too_many: &'s AtomicBool,
@@ -606,7 +936,7 @@ impl<'s> ParallelVisitorBuilder<'s> for &'s Gather<'s> {
 impl ParallelVisitor for Gatherer<'_> {
     fn visit(&mut self, entry: Result<DirEntry, ignore::Error>) -> WalkState {
         let shared = self.shared;
-        if Instant::now() >= shared.deadline {
+        if Instant::now() >= shared.deadline || shared.cancel.is_set() {
             shared.timed_out.store(true, Ordering::Relaxed);
             return WalkState::Quit;
         }
@@ -691,6 +1021,7 @@ fn gather(root: &Path, starts: &[PathBuf], shallow: bool, deadline: Instant, max
         root,
         shallow,
         deadline,
+        cancel: files::Cancel::current(),
         max_files,
         timed_out: &timed_out,
         too_many: &too_many,
@@ -1309,6 +1640,52 @@ mod tests {
         assert!(files.contains(&"logs/keep.txt".to_owned()));
         assert!(!files.iter().any(|f| f.ends_with(".log") || f.starts_with("ignored/")));
         assert!(!files.iter().any(|f| f.contains(".hidden")));
+    }
+
+    #[test]
+    fn a_cache_kept_in_ram_is_checked_on_every_call() {
+        let tree = Tree::new("ram");
+        let ram = Ram::new(2);
+        let call = || {
+            let (listing, outcome) = ram.listing_with(&tree.root, &tree.settings).expect("cached");
+            assert_eq!(listing.files, uncached(&tree.root), "{outcome:?}");
+            outcome
+        };
+        assert_eq!(call(), Outcome::Full);
+        // Held: the cache file is not needed again.
+        fs::remove_dir_all(&tree.settings.dir).unwrap();
+        assert_eq!(call(), Outcome::Hit);
+        // A change is seen, and written for the next `lwk`.
+        fs::write(tree.path("a/new.txt"), "new").unwrap();
+        assert!(updated(call()));
+        assert_eq!(tree.check("after serve"), Outcome::Hit);
+        // Given ahead of its check, a listing is known sound or not after.
+        let ahead = || {
+            checked_meanwhile(|| ram.listing_with(&tree.root, &tree.settings).map(|(listing, _)| listing.files))
+        };
+        let before = uncached(&tree.root);
+        assert_eq!(ahead(), (Some(before.clone()), true));
+        fs::remove_file(tree.path("a/new.txt")).unwrap();
+        assert_eq!(ahead(), (Some(before), false));
+        assert!(updated(call()));
+        fs::write(tree.root.join(".gitignore"), "*.log\n*.c\n").unwrap();
+        assert!(!ahead().1);
+        assert_eq!(call(), Outcome::Full);
+        assert!(ahead().1);
+        // A cancelled walk is neither kept nor written.
+        fs::write(tree.root.join(".ignore"), "ignored/\nc/\n").unwrap();
+        let flag = Arc::new(AtomicBool::new(true));
+        let cut = files::Cancel::scope(flag, || ram.listing_with(&tree.root, &tree.settings));
+        assert_eq!(cut.map(|(_, outcome)| outcome), Some(Outcome::Partial));
+        assert_eq!(call(), Outcome::Full);
+        // Only the roots used last are held.
+        for name in ["one", "two"] {
+            let other = Tree::new(&format!("ram-{name}"));
+            ram.listing_with(&other.root, &other.settings).expect("cached");
+        }
+        let held = ram.roots.lock().unwrap();
+        assert_eq!(held.len(), 2);
+        assert!(held.iter().all(|kept| kept.root != tree.root));
     }
 
     #[test]

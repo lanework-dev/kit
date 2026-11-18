@@ -9,6 +9,7 @@
 //! lwk sessions QUERY [FOLDER]    search_sessions
 //! lwk rewrite                    Claude Code's PreToolUse hook (rewrite.rs)
 //! lwk mcp                        the kit as an MCP server (mcp/)
+//! lwk serve [--idle-exit SECS]   the kit over stdin/stdout, long-lived (serve/)
 //! lwk hook on|off|status         that hook in ~/.claude/settings.json (hook.rs)
 //! lwk help | version
 //! lwk ANYTHING ELSE ...          exec()s ANYTHING ELSE (passthrough.rs)
@@ -18,6 +19,8 @@
 //!   the warm fff index. With no app to answer, lwk runs the same tools
 //!   in-process (`engine/`), in the working folder.
 //! - `lwk mcp` serves those tools as an MCP server over stdio (`mcp/`).
+//! - `lwk serve` answers the same calls as JSON lines on stdin and stdout
+//!   (`serve/`, `contract/serve.md`): many at once, the engine kept warm.
 //! - `lwk hook` turns `lwk rewrite` on or off in Claude Code (`hook.rs`).
 //! - Anything else is the command it names: lwk exec()s it, so it IS that
 //!   command from then on (same pid, terminal, signals and exit code).
@@ -32,6 +35,7 @@ mod mcp;
 mod passthrough;
 mod paths;
 mod rewrite;
+mod serve;
 mod socket;
 
 use std::ffi::OsString;
@@ -55,11 +59,14 @@ Usage:
   lwk sessions QUERY [FOLDER]   Search Claude Code, Codex and OpenCode sessions
   lwk hook on|off|status        Claude Code hook that runs plain grep -r as lwk
   lwk mcp                       Serve the kit's tools as an MCP server (stdio)
+  lwk serve [--idle-exit SECS]  Answer kit calls as JSON lines on stdin/stdout
   lwk COMMAND [ARGS...]         Run any other command unchanged
 
 Options:
   --json                Print the tool's JSON answer
   --limit N             How many results (files, paths or sessions)
+  --git                 find: rank files with uncommitted changes and recently
+                        committed files higher, as an editor's quick-open does
   -E, --regex           grep: QUERY is a regex (ripgrep syntax)
   -F, --fixed-strings   grep: QUERY is a literal (the default)
   -i, --ignore-case     grep: ignore case (the default)
@@ -119,6 +126,7 @@ fn main() {
         Some(command @ ("find" | "grep" | "sg" | "ls" | "sessions")) => kit::run(command, &rest),
         Some("rewrite") => rewrite::run_hook(),
         Some("mcp") => mcp::run(),
+        Some("serve") => serve::run(&rest),
         Some("hook") => {
             let args: Vec<String> = rest
                 .iter()
