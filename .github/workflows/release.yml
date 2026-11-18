@@ -276,9 +276,14 @@ jobs:
           cd target/distrib
           pre=""
           case "$TAG" in *-*) pre="--prerelease" ;; esac
+          # Each file once: `*.tar.*` also matched the .sha256 files, and the
+          # duplicate upload failed with a 404. The source tarball is not
+          # built, so its stray .sha256 is left out.
+          files=(./*.tar.xz ./*.tar.xz.sha256 ./*-installer.sh ./*.rb)
+          [ -f sha256.sum ] && files+=(./sha256.sum)
+          ls -l "${files[@]}"
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft $pre --verify-tag \
-            --title "$TAG" --generate-notes \
-            ./*.tar.* ./*.sha256 ./*-installer.sh ./*.rb
+            --title "$TAG" --generate-notes "${files[@]}"
       - uses: actions/upload-artifact@v4
         with:
           name: formula
