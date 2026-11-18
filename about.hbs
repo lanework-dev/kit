@@ -1,0 +1,33 @@
+# Third-party licenses
+
+`lwk` (lanework-kit) is MIT-licensed. It is built from the crates below,
+resolved from `Cargo.lock` for every target. Regenerate this file with:
+
+    cargo about generate about.hbs > THIRD_PARTY_LICENSES.md
+
+A crate under several licenses (`A AND B`) has one row for each.
+
+## Crates
+
+| Crate | Version | License |
+| --- | --- | --- |
+{{#each licenses}}
+{{#each used_by}}
+| [{{crate.name}}]({{#if crate.repository}}{{{crate.repository}}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}}) | {{crate.version}} | {{{../id}}} |
+{{/each}}
+{{/each}}
+
+## License texts
+{{#each licenses}}
+
+### {{{name}}} (`{{{id}}}`)
+
+Used by:
+{{#each used_by}}
+- {{crate.name}} {{crate.version}}
+{{/each}}
+
+```text
+{{{text}}}
+```
+{{/each}}

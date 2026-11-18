@@ -1,0 +1,40 @@
+# cargo-dist (`dist`) configuration. `dist plan` lists what a tag would build.
+# The release workflow, .github/workflows/release.yml, is written by hand
+# (macOS signing and notarization are added to it), so `allow-dirty = ["ci"]`
+# keeps `dist` from asking to regenerate it.
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.30.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app: a shell installer, and a Homebrew
+# formula.
+installers = ["shell", "homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-musl",
+]
+# The Homebrew tap the formula is published to
+tap = "lanework-dev/homebrew-tap"
+publish-jobs = ["homebrew"]
+# Every archive carries this next to the binary (dist adds LICENSE and
+# README.md on its own).
+include = ["THIRD_PARTY_LICENSES.md"]
+# The shell installer puts lwk in $CARGO_HOME/bin... and on PATH
+install-path = "CARGO_HOME"
+# Do not offer to update the shell installer's receipt on its own
+install-updater = false
+# Sign macOS binaries (reads CODESIGN_* from the environment; the release
+# workflow maps the APPLE_* secrets onto them, then notarizes).
+macos-sign = true
+# Pull requests only plan; they never build or publish.
+pr-run-mode = "plan"
+# release.yml is hand-written.
+allow-dirty = ["ci"]
