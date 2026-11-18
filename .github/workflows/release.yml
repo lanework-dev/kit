@@ -169,14 +169,21 @@ jobs:
           done
           codesign --verify --strict --verbose=2 "target/$TARGET/dist/lwk"
 
-          dist build --tag="$GITHUB_REF_NAME" --target="$TARGET" --artifacts=local --output-format=json > dist-manifest.json
+          # Per-target manifest, beside the archives (as dist's own CI does):
+          # the global step merges them all for the installers' checksums.
+          dist build --tag="$GITHUB_REF_NAME" --target="$TARGET" --artifacts=local --output-format=json > "$RUNNER_TEMP/dist-manifest.json"
+          cp "$RUNNER_TEMP/dist-manifest.json" "target/distrib/$TARGET-dist-manifest.json"
           codesign -dvv "target/$TARGET/dist/lwk" 2>&1 | grep -q '^Authority=Developer ID Application' || {
             echo "::error::dist rebuilt lwk after signing (its cargo call no longer matches ours)"; exit 1; }
           security delete-keychain "$keychain"
 
       - name: Build (Linux)
         if: contains(matrix.target, 'linux-musl')
-        run: dist build --tag="$GITHUB_REF_NAME" --target=${{ matrix.target }} --artifacts=local --output-format=json > dist-manifest.json
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          dist build --tag="$GITHUB_REF_NAME" --target="$TARGET" --artifacts=local --output-format=json > "$RUNNER_TEMP/dist-manifest.json"
+          cp "$RUNNER_TEMP/dist-manifest.json" "target/distrib/$TARGET-dist-manifest.json"
 
       # Gatekeeper wants a notarized ticket for a downloaded binary. A bare
       # Mach-O cannot be stapled, so the ticket stays with Apple; the archive
@@ -192,7 +199,7 @@ jobs:
           work="$(mktemp -d "$RUNNER_TEMP/notarize.XXXXXX")"
           umask 077
           printf '%s\n' "$APPLE_API_KEY_P8" > "$work/AuthKey.p8"
-          archive="$(ls target/distrib/*-"$TARGET".tar.* | head -n1)"
+          archive="target/distrib/lanework-kit-$TARGET.tar.xz"
           mkdir "$work/unpacked"
           tar -xf "$archive" -C "$work/unpacked"
           bin="$(find "$work/unpacked" -type f -name lwk | head -n1)"
@@ -220,10 +227,12 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: artifacts-build-local-${{ matrix.target }}
+          # Only files under target/distrib: the artifact keeps them flat.
           path: |
-            target/distrib/*.tar.*
-            target/distrib/*.sha256
-            dist-manifest.json
+            target/distrib/*.tar.xz
+            target/distrib/*.tar.xz.sha256
+            target/distrib/*-dist-manifest.json
+          if-no-files-found: error
 
   build-global:
     name: installers
@@ -244,14 +253,23 @@ jobs:
           merge-multiple: true
       - name: Build the shell installer and the Homebrew formula
         run: |
-          dist build --tag="$GITHUB_REF_NAME" --artifacts=global --output-format=json > dist-manifest.json
+          ls -l target/distrib
+          dist build --tag="$GITHUB_REF_NAME" --artifacts=global --output-format=json > "$RUNNER_TEMP/global-dist-manifest.json"
+          # Every archive must have its checksum in the formula.
+          n="$(grep -c 'sha256 "' target/distrib/lanework-kit.rb)"
+          if [ "$n" != 4 ]; then
+            echo "::error::lanework-kit.rb has $n sha256 lines, expected 4"; cat target/distrib/lanework-kit.rb; exit 1
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: artifacts-build-global
           path: |
             target/distrib/*-installer.sh
             target/distrib/*.rb
-            target/distrib/*.sha256
+            target/distrib/source.tar.gz
+            target/distrib/source.tar.gz.sha256
+            target/distrib/sha256.sum
+          if-no-files-found: error
 
   host:
     name: draft release
@@ -276,11 +294,13 @@ jobs:
           cd target/distrib
           pre=""
           case "$TAG" in *-*) pre="--prerelease" ;; esac
-          # Each file once: `*.tar.*` also matched the .sha256 files, and the
-          # duplicate upload failed with a 404. The source tarball is not
-          # built, so its stray .sha256 is left out.
-          files=(./*.tar.xz ./*.tar.xz.sha256 ./*-installer.sh ./*.rb)
-          [ -f sha256.sum ] && files+=(./sha256.sum)
+          # Each file once (`*.tar.*` used to match the .sha256 files too, and
+          # the duplicate upload failed with a 404); all must be there.
+          shopt -s failglob
+          files=(./*.tar.xz ./*.tar.xz.sha256 ./*-installer.sh ./*.rb ./source.tar.gz ./source.tar.gz.sha256 ./sha256.sum)
+          if [ "$(ls ./*.tar.xz | grep -vc source)" != 4 ]; then
+            echo "::error::expected 4 archives"; ls -l; exit 1
+          fi
           ls -l "${files[@]}"
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft $pre --verify-tag \
             --title "$TAG" --generate-notes "${files[@]}"
