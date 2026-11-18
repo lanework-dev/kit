@@ -1,0 +1,224 @@
+{
+  "version": "1.0.0",
+  "source": "packages/protocol/src/tools/kit.ts (KIT_TOOLS, KIT_TOOL_LIMITS, STRUCTURAL_LANGS)",
+  "structuralLangs": [
+    "ts",
+    "tsx",
+    "js",
+    "jsx",
+    "json",
+    "css",
+    "html",
+    "python",
+    "rust",
+    "go"
+  ],
+  "limits": {
+    "find_files": {
+      "default": 50,
+      "max": 200
+    },
+    "search_text": {
+      "default": 50,
+      "max": 200
+    },
+    "search_structural": {
+      "default": 50,
+      "max": 200
+    },
+    "list_files": {
+      "default": 1000,
+      "max": 50000
+    },
+    "search_sessions": {
+      "default": 20,
+      "max": 50
+    }
+  },
+  "tools": [
+    {
+      "name": "find_files",
+      "description": "Fuzzy-find files by path in a folder, best match first. Respects .gitignore. Returns each file's path, score and the matched character ranges.",
+      "readOnly": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Part of a file name or path, e.g. `mcp tools`"
+          },
+          "folder": {
+            "type": "string",
+            "description": "The folder to search, an absolute path (e.g. the repo's root); the working directory when omitted"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Files returned; default 50",
+            "minimum": 1,
+            "maximum": 200
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false
+      },
+      "limits": {
+        "default": 50,
+        "max": 200
+      }
+    },
+    {
+      "name": "search_text",
+      "description": "Search the contents of a folder's files with ripgrep. Respects .gitignore; skips hidden and binary files. Returns each matching file with its matching lines (1-based) and match ranges; `truncated` marks where the search stopped.",
+      "readOnly": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "A literal string, or a regex when `regex` is true"
+          },
+          "folder": {
+            "type": "string",
+            "description": "The folder to search, an absolute path (e.g. the repo's root); the working directory when omitted"
+          },
+          "regex": {
+            "type": "boolean",
+            "description": "Read `query` as a regex (ripgrep's syntax)"
+          },
+          "case_sensitive": {
+            "type": "boolean",
+            "description": "Match case; ignored when omitted"
+          },
+          "globs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "ripgrep globs limiting the files; a leading `!` excludes"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Files returned; default 50",
+            "minimum": 1,
+            "maximum": 200
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false
+      },
+      "limits": {
+        "default": 50,
+        "max": 200
+      }
+    },
+    {
+      "name": "search_structural",
+      "description": "Search a folder's code by syntax with an ast-grep pattern, e.g. `console.log($A)`. Respects .gitignore. Returns each matching file with its matching lines and match ranges, as search_text does.",
+      "readOnly": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "An ast-grep pattern; `$A` matches one node"
+          },
+          "folder": {
+            "type": "string",
+            "description": "The folder to search, an absolute path (e.g. the repo's root); the working directory when omitted"
+          },
+          "lang": {
+            "type": "string",
+            "enum": [
+              "ts",
+              "tsx",
+              "js",
+              "jsx",
+              "json",
+              "css",
+              "html",
+              "python",
+              "rust",
+              "go"
+            ],
+            "description": "The pattern's language; each file's own, from its extension, when omitted"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Files returned; default 50",
+            "minimum": 1,
+            "maximum": 200
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "additionalProperties": false
+      },
+      "limits": {
+        "default": 50,
+        "max": 200
+      }
+    },
+    {
+      "name": "list_files",
+      "description": "Every file in a folder that ripgrep would search: .gitignore respected, hidden files skipped. Paths in no particular order; `truncated` when cut at the limit.",
+      "readOnly": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "folder": {
+            "type": "string",
+            "description": "The folder to search, an absolute path (e.g. the repo's root); the working directory when omitted"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Paths returned; default 1000",
+            "minimum": 1,
+            "maximum": 50000
+          }
+        },
+        "additionalProperties": false
+      },
+      "limits": {
+        "default": 1000,
+        "max": 50000
+      }
+    },
+    {
+      "name": "search_sessions",
+      "description": "Search this machine's Claude Code, Codex and OpenCode conversations for a phrase in what was said (prompts, answers, tool calls and output), newest first. Returns each session's harness, id, title, last write and up to 3 matching snippets.",
+      "readOnly": true,
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "A literal phrase, not a regex"
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Sessions returned; default 20",
+            "minimum": 1,
+            "maximum": 50
+          },
+          "folder": {
+            "type": "string",
+            "description": "Only sessions run in this folder (an absolute path, e.g. the repo's root); every folder's when omitted"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "additionalProperties": false
+      },
+      "limits": {
+        "default": 20,
+        "max": 50
+      }
+    }
+  ]
+}

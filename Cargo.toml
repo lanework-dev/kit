@@ -1,0 +1,88 @@
+# `lwk`: Lanework's search kit for coding agents, as one small native
+# binary. It asks the Lanework app's kit socket first and otherwise runs the
+# kit's engine (`src/engine`) in-process. `src/main.rs` has the overview.
+[package]
+name = "lanework-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/lanework-dev/kit"
+homepage = "https://github.com/lanework-dev/kit"
+description = "lwk: fast file, text, structural and session search for coding agents"
+publish = false
+
+[[bin]]
+name = "lwk"
+path = "src/main.rs"
+
+# publish = false keeps it off crates.io; dist still releases it.
+[package.metadata.dist]
+dist = true
+
+[dependencies]
+# preserve_order: `lwk rewrite` hands Claude Code its tool input back with
+# the keys where they were. raw_value: `--json` prints the app's answer as
+# it came. float_roundtrip: numbers read exactly, as JSON.parse reads them.
+serde_json = { version = "1", features = ["preserve_order", "raw_value", "float_roundtrip"] }
+serde = { version = "1", features = ["derive"] }
+
+# list_files / search_text: ripgrep's own walker and searcher.
+ignore = "0.4"
+globset = "0.4"
+grep-searcher = "0.1"
+grep-regex = "0.1"
+grep-matcher = "0.1"
+
+# find_files: neo_frizbee, the matcher fff-search uses, with fff's path
+# ranking on top (src/engine/find.rs). `match_end_col` tells whether a match
+# landed in the file name. No dependencies of its own.
+neo_frizbee = { version = "=0.13.3", default-features = false, features = ["std", "match_end_col"] }
+
+# search_structural: ast-grep with only the grammars of the contract's
+# STRUCTURAL_LANGS (ts, tsx, js, jsx, json, css, html, python, rust, go).
+ast-grep-core = "=0.51.3"
+ast-grep-language = { version = "=0.51.3", default-features = false, features = [
+    "tree-sitter-typescript",
+    "tree-sitter-javascript",
+    "tree-sitter-json",
+    "tree-sitter-css",
+    "tree-sitter-html",
+    "tree-sitter-python",
+    "tree-sitter-rust",
+    "tree-sitter-go",
+] }
+
+# Small and quick to start: a passthrough (`lwk git status`) and `lwk
+# rewrite` (every Bash call, with the hook on) pay for the start-up alone.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# The search hot paths at full speed; everything else stays small.
+[profile.release.package.regex]
+opt-level = 3
+[profile.release.package.regex-automata]
+opt-level = 3
+[profile.release.package.aho-corasick]
+opt-level = 3
+[profile.release.package.memchr]
+opt-level = 3
+[profile.release.package.grep-searcher]
+opt-level = 3
+[profile.release.package.grep-regex]
+opt-level = 3
+[profile.release.package.grep-matcher]
+opt-level = 3
+[profile.release.package.ignore]
+opt-level = 3
+[profile.release.package.globset]
+opt-level = 3
+[profile.release.package.neo_frizbee]
+opt-level = 3
+[profile.release.package.ast-grep-core]
+opt-level = 3
+[profile.release.package.tree-sitter]
+opt-level = 3
