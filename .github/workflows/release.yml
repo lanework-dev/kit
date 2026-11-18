@@ -155,7 +155,11 @@ jobs:
             exit 1
           fi
 
-          cargo build --locked --profile dist --target "$TARGET" --workspace
+          # Exactly dist's own cargo call (RUSTFLAGS="" included: dist always
+          # passes it), so dist's build below finds everything fresh instead
+          # of rebuilding over the signed binary.
+          RUSTFLAGS="" cargo build --profile dist --message-format=json-render-diagnostics \
+            --target "$TARGET" --workspace > /dev/null
           # The final binary and the copy cargo keeps in its build dir (the
           # one it copies back over the final one on every build).
           for bin in "target/$TARGET/dist/lwk" target/"$TARGET"/dist/build/lanework-kit/*/out/lwk; do
@@ -166,6 +170,8 @@ jobs:
           codesign --verify --strict --verbose=2 "target/$TARGET/dist/lwk"
 
           dist build --tag="$GITHUB_REF_NAME" --target="$TARGET" --artifacts=local --output-format=json > dist-manifest.json
+          codesign -dvv "target/$TARGET/dist/lwk" 2>&1 | grep -q '^Authority=Developer ID Application' || {
+            echo "::error::dist rebuilt lwk after signing (its cargo call no longer matches ours)"; exit 1; }
           security delete-keychain "$keychain"
 
       - name: Build (Linux)
