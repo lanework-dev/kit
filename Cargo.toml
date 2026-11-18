@@ -3,7 +3,7 @@
 # kit's engine (`src/engine`) in-process. `src/main.rs` has the overview.
 [package]
 name = "lanework-kit"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/lanework-dev/kit"
