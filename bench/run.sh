@@ -26,6 +26,9 @@
 #
 # Jobs (JOBS=a,b takes group names or full ids, e.g. `grep` or `grep-vscode`)
 #   find grep sg ls   per corpus      startup   lwk's pass-through
+#   serve             per corpus: repeated find_files and list_files through one
+#                     `lwk serve` (bench/serve_bench.py), median and p90 per query,
+#                     set against the CLI warm-cache numbers of the find and ls jobs
 #   sessions          always last: lwk against grep -r over past chats
 # They run in that order, sessions last, because it is the one that reads the most.
 #
@@ -78,6 +81,7 @@
 #   VSCODE_TAG        pinned vscode tag
 #   WARMUP            warm-up runs (default 1)
 #   MIN_RUNS MAX_RUNS adaptive bounds (default 3 / 10)
+#   SERVE_RUNS        requests per query in the serve job (default 200)
 #   SLOW_S            a command whose first run takes this long (default 5 s)
 #                     is timed once (that first run, which also saves its output)
 #   BENCH_LIVE_GREP=1 also run plain `grep -r` in the live checkout: it
@@ -101,6 +105,7 @@ MIN_RUNS="${MIN_RUNS:-3}"
 MAX_RUNS="${MAX_RUNS:-10}"
 COLD_RUNS="${COLD_RUNS:-3}"
 SLOW_S="${SLOW_S:-5}"
+SERVE_RUNS="${SERVE_RUNS:-200}"
 SESSIONS_QUERY="${SESSIONS_QUERY:-useEffect}"
 SESSIONS_MB="${SESSIONS_MB:-30}"
 FULL="${BENCH_FULL:-}"
@@ -267,6 +272,7 @@ SESS_ENV="env -u CLAUDE_CONFIG_DIR -u CODEX_HOME -u OPENCODE_DATA_DIR -u OPENCOD
   echo "runs.warm=adaptive, $MIN_RUNS to $MAX_RUNS runs (warm-up $WARMUP); start-up jobs 100 and 50 runs"
   echo "runs.warmup=$WARMUP"
   echo "runs.cold=$COLD_RUNS"
+  echo "runs.serve=$SERVE_RUNS requests per query, one at a time, after one warm-up request"
   echo "cold=${COLD_CMD:+yes}"
   echo "cold.cmd=$COLD_CMD"
   echo "sessions.home=$SESSIONS_DESC"
@@ -392,7 +398,21 @@ job "startup-git" "Start-up: git status" "$LP" startup "\`lwk git status\` runs 
   lwk "$Q git status" \
   git "git status"
 
-# 7. past chats, last: it reads the most.
+# 7. lwk serve: one long-lived process, the same tools over stdin/stdout. The
+# driver sends each query once to warm it, then SERVE_RUNS times, one at a time.
+# Same XDG_CACHE_HOME and LANEWORK_HOME as above (exported). The checkouts the
+# CLI jobs use are the ones timed here, so the numbers sit side by side.
+if selected serve; then
+  echo "== serve"
+  for corpus in lanework-public ${VS:+vscode}; do
+    if [[ $corpus == vscode ]]; then D="$VS"; TYPO=terminalservce; ONE=registerCommand; MULTI="terminal service"
+    else D="$LP"; TYPO=convview; ONE=transcript; MULTI="codex transcript"; fi
+    python3 -I "$BENCH/serve_bench.py" --lwk "$LWK" --tree "$D" --runs "$SERVE_RUNS" \
+      --out "$RES/serve-$corpus.json" --git --find "typo=$TYPO" --find "one-word=$ONE" --find "multi-word=$MULTI"
+  done
+fi
+
+# 8. past chats, last: it reads the most.
 if [[ -n "$REAL_SESSIONS" ]]; then
   job "sessions" "Past chats" "$SESSIONS_CWD" sessions \
     "query \`$SESSIONS_QUERY\` over $SESSIONS_DESC, from \`$(basename "$SESSIONS_CWD")\`; one run, no warm-up" single "" -- \

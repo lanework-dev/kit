@@ -279,6 +279,38 @@ every file the tool lists.
 
 **Summary.** lwk ran in 23.0 ms: **slower** than `git` (1.35× slower). The fastest here is `git` (17.0 ms); lwk is not the fastest on this job. lwk's pass-through `exec()`s the command, so the cost is lwk's own start-up (a small static binary) added to the command's. This is what every hooked Bash call pays.
 
+## lwk serve: repeated calls through one process
+
+A `lwk serve` process (the way the Lanework app and editors run it) is kept alive and sent each query once to warm it, then 200 requests per query, one at a time, after one warm-up request. Each time is the round trip: the request line written until its answer line is read, in `bench/serve_bench.py`. The CLI column is the mean of `lwk` in the find or ls job on the same corpus (file-list cache warm), which pays a process start on every call; there is no CLI row for the other finds because the find jobs time the misspelled name only (`typo`).
+
+### lanework-public
+
+| Query | Median | p90 | First call | Results | CLI warm (mean) | CLI ÷ serve median |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| find typo `convview` | 0.53 ms | 0.66 ms | 1.39 ms | 50 | 4.84 ms | 9.23× |
+| find typo --git `convview` | 0.65 ms | 0.89 ms | 34.5 ms | 50 | — | — |
+| find one-word `transcript` | 0.74 ms | 0.97 ms | 0.86 ms | 50 | — | — |
+| find one-word --git `transcript` | 0.88 ms | 1.37 ms | 0.92 ms | 50 | — | — |
+| find multi-word `codex transcript` | 1.00 ms | 1.25 ms | 1.05 ms | 50 | — | — |
+| find multi-word --git `codex transcript` | 1.17 ms | 1.61 ms | 1.06 ms | 50 | — | — |
+| ls | 0.51 ms | 0.71 ms | 0.61 ms | 851 | 7.51 ms | 14.7× |
+| ls all | 0.48 ms | 0.70 ms | 1.22 ms | 851 | 3.41 ms | 7.05× |
+
+### vscode
+
+| Query | Median | p90 | First call | Results | CLI warm (mean) | CLI ÷ serve median |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| find typo `terminalservce` | 3.53 ms | 4.42 ms | 7.57 ms | 50 | 10.9 ms | 3.09× |
+| find typo --git `terminalservce` | 4.01 ms | 4.81 ms | 548 ms | 50 | — | — |
+| find one-word `registerCommand` | 2.96 ms | 3.63 ms | 3.15 ms | 50 | — | — |
+| find one-word --git `registerCommand` | 3.34 ms | 4.24 ms | 501 ms | 50 | — | — |
+| find multi-word `terminal service` | 4.94 ms | 5.80 ms | 5.33 ms | 50 | — | — |
+| find multi-word --git `terminal service` | 5.25 ms | 6.74 ms | 550 ms | 50 | — | — |
+| ls | 3.00 ms | 4.05 ms | 3.04 ms | 1,000 | 10.9 ms | 3.62× |
+| ls all | 5.06 ms | 6.60 ms | 4.71 ms | 8,331 | 12.7 ms | 2.51× |
+
+**Summary.** **lanework-public.** A one-word find took a median of 0.74 ms through serve and a multi-word find 1.00 ms. **vscode.** A one-word find took a median of 2.96 ms through serve and a multi-word find 4.94 ms. Against the CLI with a warm file-list cache, serve answered the same misspelled find and the same listings in a fraction of the time (see the last column): it saves the process start, the cache read and the index build, which the CLI pays on every call. It does not make find free: the fuzzy scoring still runs on every call, so a multi-word query costs more than a one-word one, and the time grows with the number of files. A find with `git: true` costs a little more per call; the first one of a fresh serve also reads `git status` (see First call), and later calls reuse it for a short while. The times include a JSON line each way over a pipe, no network, and one request in flight at a time. Medians of one machine on one day: read the ratios, not the milliseconds.
+
 ## Past chats
 
 query `useEffect` over a synthetic home of 30 MB (bench/gen_sessions.py), scoped to the lanework-public folder.

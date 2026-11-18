@@ -259,6 +259,66 @@ def notes_for(jid, kind, warm, st, outdir):
     return n
 
 
+def serve_section(res, meta, jobs):
+    """One section for the serve job: round trips through one `lwk serve`,
+    next to the CLI warm-cache means of the find and ls jobs on the same corpus."""
+    names = sorted(n for n in os.listdir(res) if n.startswith("serve-") and n.endswith(".json"))
+    if not names:
+        return []
+    o = ["## lwk serve: repeated calls through one process\n",
+         "A `lwk serve` process (the way the Lanework app and editors run it) is kept alive and sent each query once to warm it, then "
+         + meta.get("runs.serve", "many requests, one at a time")
+         + ". Each time is the round trip: the request line written until its answer line is read, in `bench/serve_bench.py`. "
+         "The CLI column is the mean of `lwk` in the find or ls job on the same corpus (file-list cache warm), which pays a process start on every call; "
+         "there is no CLI row for the other finds because the find jobs time the misspelled name only (`typo`).\n"]
+    cli_of = {}
+    for jid, *_ in jobs:
+        warm = load(os.path.join(res, jid + ".warm.json"), os.path.join(res, jid + ".warm-slow.json"))
+        if warm:
+            cli_of[jid] = warm
+    summaries = []
+    for n in names:
+        corpus = n[len("serve-"):-len(".json")]
+        data = json.loads(read_text(os.path.join(res, n)) or b"{}")
+        rows = data.get("results") or []
+        if not rows:
+            continue
+        o.append(f"### {corpus}\n")
+        o.append("| Query | Median | p90 | First call | Results | CLI warm (mean) | CLI ÷ serve median |")
+        o.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+        med = {}
+        for r in rows:
+            med[r["name"]] = r["median"]
+            cli_mean = None
+            if r["name"] == "find typo":
+                cli_mean = (cli_of.get("find-" + corpus) or {}).get("lwk")
+            elif r["name"] == "ls":
+                cli_mean = (cli_of.get("ls-" + corpus) or {}).get("lwk")
+            elif r["name"] == "ls all":
+                cli_mean = (cli_of.get("ls-" + corpus) or {}).get("lwk-all")
+            q = f" `{r['query']}`" if r.get("query") else ""
+            o.append(f"| {r['name']}{q} | {fmt_t(r['median'])} | {fmt_t(r['p90'])} | {fmt_t(r['first'])} | {r['results']:,} | "
+                     + (fmt_t(cli_mean["mean"]) if cli_mean else "—") + " | "
+                     + (ratio(cli_mean["mean"], r["median"]) if cli_mean else "—") + " |")
+        o.append("")
+        one, multi = med.get("find one-word"), med.get("find multi-word")
+        line = f"**{corpus}.** "
+        if one is not None:
+            line += f"A one-word find took a median of {fmt_t(one)} through serve"
+            if multi is not None:
+                line += f" and a multi-word find {fmt_t(multi)}"
+            line += ". "
+        summaries.append(line)
+    o.append("**Summary.** " + "".join(summaries) +
+             "Against the CLI with a warm file-list cache, serve answered the same misspelled find and the same listings in a fraction of the time (see the last column): "
+             "it saves the process start, the cache read and the index build, which the CLI pays on every call. "
+             "It does not make find free: the fuzzy scoring still runs on every call, so a multi-word query costs more than a one-word one, and the time grows with the number of files. "
+             "A find with `git: true` costs a little more per call; the first one of a fresh serve also reads `git status` (see First call), and later calls reuse it for a short while. "
+             "The times include a JSON line each way over a pipe, no network, and one request in flight at a time. "
+             "Medians of one machine on one day: read the ratios, not the milliseconds.\n")
+    return o
+
+
 def main():
     res, dest = sys.argv[1], sys.argv[2]
     wall = sys.argv[3] if len(sys.argv) > 3 else None
@@ -272,7 +332,7 @@ def main():
     for l in (read_text(os.path.join(res, "jobs.tsv")) or b"").decode().splitlines():
         jid, title, corpus, kind, desc = l.split("\t")
         jobs.append((jid, title, corpus, kind, desc))
-    if not jobs:
+    if not jobs and not any(n.startswith("serve-") for n in os.listdir(res)):
         sys.exit("no results in " + res)
 
     o = []
@@ -325,7 +385,11 @@ def main():
                             "with sessions in the corpus folder, inside it, and outside it, so lwk's search is scoped and `grep -r` reads all of it. "
                             "`grep -r` covers the Claude and Codex files only (OpenCode keeps its sessions in a database).")
     overview = []
+    served = False
     for jid, title, corpus, kind, desc in jobs:
+        if jid == "sessions":   # the serve section comes before sessions
+            o.extend(serve_section(res, meta, jobs))
+            served = True
         warm = load(os.path.join(res, jid + ".warm.json"), os.path.join(res, jid + ".warm-slow.json"))
         if not warm:
             continue
@@ -351,6 +415,8 @@ def main():
             overview.append((jid, lw["mean"], nc["mean"] if nc else None, fk, fv["mean"]))
         o.append("**Summary.** " + summary(jid, kind, warm, st, notes_for(jid, kind, warm, st, outdir)) + "\n")
 
+    if not served:
+        o.extend(serve_section(res, meta, jobs))
     if overview:
         table_o = ["## Overview\n", "lwk against the fastest other command of each job (warm, mean). In the find and ls jobs, `lwk` has the file-list cache warm and `lwk-nocache` is the first-call cost (full walk).\n",
                    "| Job | lwk | lwk-nocache | Fastest other | lwk vs it | lwk-nocache vs it |", "| --- | ---: | ---: | --- | ---: | ---: |"]
