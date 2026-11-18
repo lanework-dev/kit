@@ -115,16 +115,42 @@ jobs:
         if: contains(matrix.target, 'linux-musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Build (macOS, signed by dist)
+      # dist 0.30 left the binary unsigned (only the linker's ad-hoc
+      # signature on arm64), so the binary is signed here, between cargo's
+      # build and dist's packaging: dist's own `cargo build` then finds it
+      # fresh and packs the signed file as it is.
+      - name: Build and sign (macOS)
         if: contains(matrix.target, 'apple-darwin')
         env:
-          # dist's `macos-sign` reads these; the APPLE_* secrets feed them.
-          CODESIGN_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          CODESIGN_CERTIFICATE: ${{ secrets.APPLE_CERT_P12_BASE64 }}
-          CODESIGN_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
-          # Hardened runtime: notarization refuses binaries without it.
-          CODESIGN_OPTIONS: runtime
-        run: dist build --tag="$GITHUB_REF_NAME" --target=${{ matrix.target }} --artifacts=local --output-format=json > dist-manifest.json
+          APPLE_CERT_P12_BASE64: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          kc_pass="$(openssl rand -hex 24)"
+          umask 077
+          printf '%s' "$APPLE_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$kc_pass" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kc_pass" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$kc_pass" "$keychain" > /dev/null
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          cargo build --locked --profile dist --target "$TARGET" --workspace
+          # The final binary and the copy cargo keeps in its build dir (the
+          # one it copies back over the final one on every build).
+          for bin in "target/$TARGET/dist/lwk" target/"$TARGET"/dist/build/lanework-kit/*/out/lwk; do
+            [ -f "$bin" ] || continue
+            codesign --force --options runtime --timestamp \
+              --keychain "$keychain" --sign "$APPLE_SIGNING_IDENTITY" "$bin"
+          done
+          codesign --verify --strict --verbose=2 "target/$TARGET/dist/lwk"
+
+          dist build --tag="$GITHUB_REF_NAME" --target="$TARGET" --artifacts=local --output-format=json > dist-manifest.json
+          security delete-keychain "$keychain"
 
       - name: Build (Linux)
         if: contains(matrix.target, 'linux-musl')
@@ -148,10 +174,25 @@ jobs:
           mkdir "$work/unpacked"
           tar -xf "$archive" -C "$work/unpacked"
           bin="$(find "$work/unpacked" -type f -name lwk | head -n1)"
+          # The packed binary must carry the Developer ID signature, not the
+          # linker's ad-hoc one.
           codesign --verify --strict --verbose=2 "$bin"
+          codesign -dvv "$bin" 2>&1 | grep -q '^Authority=Developer ID Application' || {
+            echo "::error::$bin is not signed with the Developer ID"; exit 1; }
           ditto -c -k --keepParent "$bin" "$work/lwk.zip"
-          xcrun notarytool submit "$work/lwk.zip" --wait \
-            --key "$work/AuthKey.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER"
+          # notarytool exits 0 even when Apple answers Invalid: check the status.
+          xcrun notarytool submit "$work/lwk.zip" --wait --output-format json \
+            --key "$work/AuthKey.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" \
+            > "$work/result.json"
+          cat "$work/result.json"
+          status="$(plutil -extract status raw -o - "$work/result.json")"
+          if [ "$status" != "Accepted" ]; then
+            id="$(plutil -extract id raw -o - "$work/result.json")"
+            xcrun notarytool log "$id" \
+              --key "$work/AuthKey.p8" --key-id "$APPLE_API_KEY_ID" --issuer "$APPLE_API_ISSUER" || true
+            echo "::error::Notarization status: $status"
+            exit 1
+          fi
           rm -rf "$work"
 
       - uses: actions/upload-artifact@v4

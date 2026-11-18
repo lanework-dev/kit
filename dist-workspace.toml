@@ -31,9 +31,9 @@ include = ["THIRD_PARTY_LICENSES.md"]
 install-path = "CARGO_HOME"
 # Do not offer to update the shell installer's receipt on its own
 install-updater = false
-# Sign macOS binaries (reads CODESIGN_* from the environment; the release
-# workflow maps the APPLE_* secrets onto them, then notarizes).
-macos-sign = true
+# macOS binaries are signed by the release workflow itself (dist 0.30's
+# macos-sign left them unsigned), then notarized.
+macos-sign = false
 # Pull requests only plan; they never build or publish.
 pr-run-mode = "plan"
 # release.yml is hand-written.
