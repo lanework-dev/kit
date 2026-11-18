@@ -970,12 +970,12 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// A quick checksum, eight bytes at a time.
 fn checksum(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0x9e37_79b9_7f4a_7c15 ^ bytes.len() as u64;
-    let mut words = bytes.chunks_exact(8);
-    for word in &mut words {
-        let word = u64::from_le_bytes(word.try_into().unwrap_or([0; 8]));
+    let (words, rest) = bytes.as_chunks::<8>();
+    for word in words {
+        let word = u64::from_le_bytes(*word);
         hash = (hash ^ word).wrapping_mul(0xff51_afd7_ed55_8ccd).rotate_left(29);
     }
-    for &byte in words.remainder() {
+    for &byte in rest {
         hash = (hash ^ u64::from(byte)).wrapping_mul(0xc4ce_b9fe_1a85_ec53);
     }
     hash ^ (hash >> 32)

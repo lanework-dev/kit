@@ -7,7 +7,6 @@ version = "0.1.0-rc.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/lanework-dev/kit"
-homepage = "https://github.com/lanework-dev/kit"
 description = "lwk: fast file, text, structural and session search for coding agents"
 publish = false
 
@@ -54,6 +53,10 @@ ast-grep-language = { version = "=0.51.3", default-features = false, features = 
 
 # Small and quick to start: a passthrough (`lwk git status`) and `lwk
 # rewrite` (every Bash call, with the hook on) pay for the start-up alone.
+# dist builds releases with its own profile; same settings as release.
+[profile.dist]
+inherits = "release"
+
 [profile.release]
 opt-level = "z"
 lto = true

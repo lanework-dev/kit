@@ -174,7 +174,7 @@ pub fn search_sessions(
         let mut candidates = claude::candidates(home, &scope);
         candidates.extend(codex.join().unwrap_or_default());
         // Newest first; a stable sort, so equal times keep Claude first.
-        candidates.sort_by(|a, b| b.mtime_ns.cmp(&a.mtime_ns));
+        candidates.sort_by_key(|c| std::cmp::Reverse(c.mtime_ns));
 
         let names: OnceCell<HashMap<String, String>> = OnceCell::new();
         let mut budget = FIRST_BATCH_BYTES;
