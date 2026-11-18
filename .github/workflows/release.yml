@@ -136,8 +136,24 @@ jobs:
           security set-keychain-settings -lut 21600 "$keychain"
           security unlock-keychain -p "$kc_pass" "$keychain"
           security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          # The Developer ID intermediate, in case the .p12 lacks the chain:
+          # without it the identity is untrusted and codesign cannot use it.
+          curl -fsSL https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer -o "$RUNNER_TEMP/DeveloperIDG2CA.cer"
+          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$keychain" || true
           security set-key-partition-list -S apple-tool:,apple: -s -k "$kc_pass" "$keychain" > /dev/null
+          # codesign looks identities up through the search list.
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
           rm -f "$RUNNER_TEMP/cert.p12"
+
+          # Sign by the identity's SHA-1, found in this keychain: immune to a
+          # stray space or newline in the APPLE_SIGNING_IDENTITY secret.
+          security find-identity -v -p codesigning "$keychain"
+          identity="$(security find-identity -v -p codesigning "$keychain" \
+            | awk '/Developer ID Application/ { print $2; exit }')"
+          if [ -z "$identity" ]; then
+            echo "::error::No valid Developer ID Application identity in the imported certificate"
+            exit 1
+          fi
 
           cargo build --locked --profile dist --target "$TARGET" --workspace
           # The final binary and the copy cargo keeps in its build dir (the
@@ -145,7 +161,7 @@ jobs:
           for bin in "target/$TARGET/dist/lwk" target/"$TARGET"/dist/build/lanework-kit/*/out/lwk; do
             [ -f "$bin" ] || continue
             codesign --force --options runtime --timestamp \
-              --keychain "$keychain" --sign "$APPLE_SIGNING_IDENTITY" "$bin"
+              --keychain "$keychain" --sign "$identity" "$bin"
           done
           codesign --verify --strict --verbose=2 "target/$TARGET/dist/lwk"
 
