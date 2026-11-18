@@ -66,6 +66,13 @@ pub fn result_line(id: &str, result: &str) -> String {
     format!("{{\"id\":{id},\"result\":{result}}}\n")
 }
 
+/// `{"id": ID, "result": RESULT, "note": NOTE}` as a line: an answer with
+/// the engine's note beside it (search_structural's fixed pattern).
+pub fn noted_result_line(id: &str, result: &str, note: &str) -> String {
+    let note = jsonjs::stringify(&Value::String(note.to_owned()));
+    format!("{{\"id\":{id},\"result\":{result},\"note\":{note}}}\n")
+}
+
 /// `{"id": ID, "error": {code, message}}` as a line; `id` is JSON text.
 pub fn error_line(id: &str, error: &KitError) -> String {
     let error = jsonjs::stringify(&error.to_json());
@@ -148,6 +155,10 @@ mod tests {
     #[test]
     fn writes_answers_as_the_socket_does() {
         assert_eq!(result_line("1", "null"), "{\"id\":1,\"result\":null}\n");
+        assert_eq!(
+            noted_result_line("1", "[]", "a \"b\""),
+            "{\"id\":1,\"result\":[],\"note\":\"a \\\"b\\\"\"}\n"
+        );
         let error = KitError::invalid("No \"x\".");
         assert_eq!(
             error_line("\"a\"", &error),

@@ -3,8 +3,8 @@
 //!
 //! ```text
 //! lwk find QUERY [FOLDER]        find_files         (kit.rs)
-//! lwk grep QUERY [FOLDER]        search_text
-//! lwk sg PATTERN [FOLDER]        search_structural
+//! lwk grep QUERY [PATH]          search_text
+//! lwk sg PATTERN [PATH]          search_structural
 //! lwk ls [FOLDER]                list_files
 //! lwk sessions QUERY [FOLDER]    search_sessions
 //! lwk rewrite                    Claude Code's PreToolUse hook (rewrite.rs)
@@ -53,8 +53,8 @@ const HELP: &str = "lwk: Lanework's search kit for coding agents.
 
 Usage:
   lwk find QUERY [FOLDER]       Fuzzy-find files by path, best first
-  lwk grep QUERY [FOLDER]       Search file contents (a literal unless -E)
-  lwk sg PATTERN [FOLDER]       Search code by syntax (ast-grep pattern)
+  lwk grep QUERY [PATH]         Search file contents (a literal unless -E)
+  lwk sg PATTERN [PATH]         Search code by syntax (ast-grep pattern)
   lwk ls [FOLDER]               List the files rg would search
   lwk sessions QUERY [FOLDER]   Search Claude Code, Codex and OpenCode sessions
   lwk hook on|off|status        Claude Code hook that runs plain grep -r as lwk
@@ -64,20 +64,30 @@ Usage:
 
 Options:
   --json                Print the tool's JSON answer
-  --limit N             How many results (files, paths or sessions)
+  --limit N             How many results (files, paths or sessions). grep and
+                        sg: files, each with all its matching lines, up to
+                        --max-lines lines in total
+  --max-lines N         grep, sg: matching lines in total, over all files
+                        (default and most 2000)
   --git                 find: rank files with uncommitted changes and recently
                         committed files higher, as an editor's quick-open does
   -E, --regex           grep: QUERY is a regex (ripgrep syntax)
   -F, --fixed-strings   grep: QUERY is a literal (the default)
   -i, --ignore-case     grep: ignore case (the default)
   -s, --case-sensitive  grep: match case
-  -g, --glob GLOB       grep: only files matching GLOB; a leading ! excludes
+  -g, --glob GLOB       grep, sg: only files matching GLOB; a leading ! excludes
   --lang LANG           sg: the pattern's language
 
-.gitignore is respected and hidden files are skipped. FOLDER defaults to
-the working folder, and must be inside it unless the Lanework app is running
-and the folder belongs to the same project; / and your home folder itself
-are never searched. Exit code: 0 found, 1 nothing found, 2 error.
+PATH is a folder or, for grep and sg, one file, whose matches are printed
+under the path as typed. sg runs a declaration pattern that lacks its body
+(def $F($$$A), fn $N($$$A), impl $T, function $F($$$A)) with the body
+added, and says so on stderr.
+
+.gitignore is respected and hidden files are skipped. FOLDER and PATH
+default to the working folder, and must be inside it unless the Lanework app
+is running and the folder belongs to the same project (a file, --max-lines
+and sg -g run without the app); / and your home folder itself are never
+searched. Exit code: 0 found, 1 nothing found, 2 error.
 
 find and ls keep the folder's file list in a cache ($XDG_CACHE_HOME/lwk,
 else ~/Library/Caches/lwk on macOS or ~/.cache/lwk), checked against the

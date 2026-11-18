@@ -3,7 +3,7 @@
 //! client that keeps one `lwk` running instead of starting one per call.
 //!
 //! - The main thread reads requests. A tool call runs on a worker
-//!   ([`pool`]) through `engine::run_in`, with the `cwd` and `roots` the
+//!   ([`pool`]) through `engine::run_noted`, with the `cwd` and `roots` the
 //!   request gives as its scope; `hello`, `cancel` and `shutdown` are
 //!   answered by the main thread at once.
 //! - Many calls may be in flight; each answer is one line written whole
@@ -234,7 +234,7 @@ impl Server {
                 return;
             }
             let params = Value::Object(params);
-            let run = || engine::run_in(tool.name(), &params, &ctx);
+            let run = || engine::run_noted(tool.name(), &params, &ctx);
             let found = Cancel::scope(cancel, || {
                 // The files held in memory are used while their check runs;
                 // had they changed, the call is run again on fresh ones.
@@ -244,7 +244,10 @@ impl Server {
                 }
             });
             let line = match &found {
-                Ok(result) => wire::result_line(&key, &jsonjs::stringify(result)),
+                Ok(answered) => match &answered.note {
+                    None => wire::result_line(&key, &jsonjs::stringify(&answered.result)),
+                    Some(note) => wire::noted_result_line(&key, &jsonjs::stringify(&answered.result), note),
+                },
                 Err(error) => wire::error_line(&key, error),
             };
             if server.land(&key, seq) {

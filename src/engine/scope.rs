@@ -59,23 +59,38 @@ pub fn real_roots(roots: &[PathBuf]) -> Result<Vec<PathBuf>, KitError> {
     Ok(out)
 }
 
-/// The folder a tool runs in: `folder` (relative to `cwd` when relative),
-/// or `cwd` when unset, as a real path that is one of `roots` or under one.
+/// What a tool's `path` names: a folder, or one regular file in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// A real folder in scope.
+    Folder(PathBuf),
+    /// A regular file in scope.
+    File {
+        /// The file's real path.
+        file: PathBuf,
+        /// Its name as the path named it (the last part, before symlinks
+        /// are followed): the path an answer gives it.
+        name: String,
+    },
+}
+
+/// What `path` names (relative to `cwd` when relative; `cwd` when unset):
+/// a real folder or regular file that is one of `roots` or under one.
 ///
-/// Fails `invalid` when `cwd` is not absolute; `not_found` when the folder
-/// does not exist or is not a folder; `scope` when it is outside every
-/// root, or no root is usable.
-pub fn resolve_folder(
-    folder: Option<&str>,
+/// Fails `invalid` when `cwd` is not absolute; `not_found` when nothing is
+/// there, or it is neither a folder nor a regular file; `scope` when it is
+/// outside every root (a symlink by where it leads), or no root is usable.
+pub fn resolve_target(
+    path: Option<&str>,
     cwd: &Path,
     roots: &[PathBuf],
-) -> Result<PathBuf, KitError> {
+) -> Result<Target, KitError> {
     if !cwd.is_absolute() {
         return Err(KitError::invalid("The working folder must be absolute."));
     }
     let asked = PathBuf::from(paths::resolve(
         &cwd.to_string_lossy(),
-        folder.unwrap_or("."),
+        path.unwrap_or("."),
     ));
     let allowed = real_roots(roots)?;
     let outside = || {
@@ -99,12 +114,18 @@ pub fn resolve_folder(
             asked.display()
         )));
     };
-    if !found.is_dir() {
-        return Err(KitError::not_found(format!(
-            "That is not a folder: {}",
-            asked.display()
-        )));
+    if found.is_dir() {
+        if allowed.is_empty() {
+            return Err(KitError::scope(
+                "No folder is open to search here. Run it inside a project folder.",
+            ));
+        }
+        if !allowed.iter().any(|root| is_within(root, &found)) {
+            return Err(outside());
+        }
+        return Ok(Target::Folder(found));
     }
+    // Not a folder: out of scope first, so what lies outside is not probed.
     if allowed.is_empty() {
         return Err(KitError::scope(
             "No folder is open to search here. Run it inside a project folder.",
@@ -113,5 +134,68 @@ pub fn resolve_folder(
     if !allowed.iter().any(|root| is_within(root, &found)) {
         return Err(outside());
     }
-    Ok(found)
+    if !found.is_file() {
+        return Err(KitError::not_found(format!(
+            "That is not a folder or a file: {}",
+            asked.display()
+        )));
+    }
+    let name = asked
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Ok(Target::File { file: found, name })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tree(tag: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("lwk-test-scope-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("in/src")).unwrap();
+        std::fs::create_dir_all(base.join("out")).unwrap();
+        std::fs::write(base.join("in/src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(base.join("out/b.rs"), "fn b() {}\n").unwrap();
+        real(&base).unwrap()
+    }
+
+    #[test]
+    fn a_file_in_scope_is_a_target() {
+        let base = tree("file");
+        let cwd = base.join("in");
+        let roots = vec![cwd.clone()];
+        let got = resolve_target(Some("src/a.rs"), &cwd, &roots).unwrap();
+        assert_eq!(
+            got,
+            Target::File {
+                file: cwd.join("src/a.rs"),
+                name: "a.rs".to_owned()
+            }
+        );
+        assert_eq!(
+            resolve_target(Some("src"), &cwd, &roots).unwrap(),
+            Target::Folder(cwd.join("src"))
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_file_outside_scope_is_refused() {
+        let base = tree("outside");
+        let cwd = base.join("in");
+        let roots = vec![cwd.clone()];
+        let scope = super::super::types::KitErrorCode::Scope;
+        // By `..`, by an absolute path, and through a symlink.
+        assert_eq!(resolve_target(Some("../out/b.rs"), &cwd, &roots).unwrap_err().code, scope);
+        let absolute = base.join("out/b.rs");
+        assert_eq!(
+            resolve_target(Some(absolute.to_str().unwrap()), &cwd, &roots).unwrap_err().code,
+            scope
+        );
+        std::os::unix::fs::symlink(&absolute, cwd.join("link.rs")).unwrap();
+        assert_eq!(resolve_target(Some("link.rs"), &cwd, &roots).unwrap_err().code, scope);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

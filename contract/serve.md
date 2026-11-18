@@ -1,6 +1,6 @@
 # `lwk serve`: protocol
 
-Version: the contract's (`contract/kit.json`, 1.1.0). `lwk serve` is the kit
+Version: the contract's (`contract/kit.json`, 1.2.0). `lwk serve` is the kit
 socket's wire (`electron/main/kit-socket.ts` in the Lanework app) over
 stdin and stdout, so a client that speaks to `kit.sock` speaks to it with
 no change in the five tools' params or answers.
@@ -21,6 +21,7 @@ no change in the five tools' params or answers.
 ```
 → {"id": 1, "method": "find_files", "params": {...}}
 ← {"id": 1, "result": ...}
+← {"id": 1, "result": ..., "note": "..."}
 ← {"id": 1, "error": {"code": "scope", "message": "..."}}
 ```
 
@@ -31,6 +32,12 @@ no change in the five tools' params or answers.
   (`Unknown method: NAME`).
 - `params`: an object (omitted or `null` is `{}`).
 - Every answer has exactly one of `result` and `error`.
+- `note` (a string, optional; new in 1.2.0) sits beside `result` when the
+  tool changed what it was asked: `search_structural` ran its pattern with
+  the body a declaration needs added. It names the pattern searched and
+  what that one skips: `searched `def $F($$$A): $$$BODY` (added the body
+  the pattern needs; it skips defs with a return annotation; to match
+  those, add `-> $R` before the colon)`. The result is the tool's as ever.
 
 ### Errors
 
@@ -38,9 +45,9 @@ no change in the five tools' params or answers.
 
 | code          | meaning                                                      |
 | ------------- | ------------------------------------------------------------ |
-| `invalid`     | the params or the line are wrong                             |
-| `scope`       | the folder is outside the allowed roots                      |
-| `not_found`   | the folder does not exist                                    |
+| `invalid`     | the params or the line are wrong (a file as a folder tool's path) |
+| `scope`       | the path is outside the allowed roots                        |
+| `not_found`   | the path does not exist                                      |
 | `unavailable` | a tool this one needs is missing here                        |
 | `timeout`     | the search ran out of time before any match                  |
 | `aborted`     | the caller went away                                         |
@@ -65,6 +72,14 @@ no change in the five tools' params or answers.
 
 `cwd` and `roots` are not part of the tool's own params. `find_files`
 takes `git` (boolean, default false).
+
+Since 1.2.0 every tool takes `path` for the folder it runs in, and
+`folder` as its older name (both given and different is `invalid`).
+`search_text` and `search_structural` also take one file as `path`, which
+is searched alone and answered under its file name; the other tools answer
+`invalid` for a file. Both take `max_lines` (1 to 2000, default 2000), the
+matching lines answered over all files, and `search_structural` takes
+`globs` as `search_text` does. `limit` still counts files.
 
 ## Control methods
 
@@ -112,7 +127,7 @@ A search that finds files, with the cwd and a narrower root:
 
 ```
 → {"id": 1, "method": "hello"}
-← {"id": 1, "result": {"lwk": "0.1.0", "contract": "1.1.0", "pid": 4242}}
+← {"id": 1, "result": {"lwk": "0.1.0", "contract": "1.2.0", "pid": 4242}}
 → {"id": 2, "method": "find_files", "params": {"query": "kit sock", "limit": 2, "git": true, "cwd": "/work/app", "roots": ["/work/app"]}}
 ← {"id": 2, "result": [{"path": "src/socket.rs", "score": 412, "ranges": [[4, 8]]}, {"path": "contract/serve.md", "score": 190}]}
 ```
@@ -121,9 +136,16 @@ Two requests in flight, answers out of order, one error:
 
 ```
 → {"id": "a", "method": "search_text", "params": {"query": "TODO", "cwd": "/work/app"}}
-→ {"id": "b", "method": "list_files", "params": {"folder": "/etc", "cwd": "/work/app"}}
+→ {"id": "b", "method": "list_files", "params": {"path": "/etc", "cwd": "/work/app"}}
 ← {"id": "b", "error": {"code": "scope", "message": "/etc is outside the allowed folders."}}
 ← {"id": "a", "result": [{"path": "src/main.rs", "lines": [{"line": 12, "text": "// TODO", "ranges": [[3, 7]]}], "truncated": false}]}
+```
+
+A structural search whose pattern needed a body, in one file:
+
+```
+→ {"id": 3, "method": "search_structural", "params": {"pattern": "def $F($$$A)", "lang": "python", "path": "app/main.py", "cwd": "/work/app"}}
+← {"id": 3, "result": [{"path": "main.py", "lines": [{"line": 4, "text": "def run(argv):", "ranges": [[0, 14]]}], "truncated": false}], "note": "searched `def $F($$$A): $$$BODY` (added the body the pattern needs; it skips defs with a return annotation; to match those, add `-> $R` before the colon)"}
 ```
 
 Cancel a slow call, then shut down:

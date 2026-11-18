@@ -2,15 +2,18 @@
 //! with ripgrep's crates (`ignore`, `grep-searcher`, `grep-regex`)
 //! (`electron/main/fs-kit/search-text.ts`, which runs `rg --json`).
 //!
-//! - `root` is real and already in scope; `options` checked (query length,
-//!   globs count and length).
+//! - `target` is real and already in scope; `options` checked (query
+//!   length, globs count and length, `max_lines`).
+//! - A file as the target: that file alone is searched, under the name it
+//!   was given; the globs do not apply to it, as rg searches a file it is
+//!   named whatever its globs say.
 //! - The files are list_files' walk ([`files::walker`]) narrowed by the
 //!   globs, as `rg --glob` narrows it; binary files skipped as rg skips
 //!   them (stop at the first NUL byte).
 //! - A literal unless `regex`; case ignored unless `case_sensitive ==
 //!   Some(true)`. An empty query finds nothing.
-//! - The search stops at `max_files` files, at [`MATCHES_MAX`] lines over
-//!   all files, or at [`SEARCH_TIMEOUT`]; the last file is then marked
+//! - The search stops at `max_files` files, at `max_lines` lines over all
+//!   files (at most [`MAX_LINES`]), or at [`SEARCH_TIMEOUT`]; the last file is then marked
 //!   `truncated`. A timeout before any match is `timeout`.
 //! - A bad regex or glob is `invalid` ("Not a valid ...").
 //! - A line longer than [`LINE_MAX`] UTF-16 units is cut to a window
@@ -23,11 +26,12 @@
 //! found settle the answer, nothing after them in that order is walked.
 
 use super::files::{self, Cutoff, CutoffView, WalkKey};
-use super::types::{FileMatch, KitError, MatchLine, Range, TextOptions};
+use super::scope::Target;
+use super::types::{FileMatch, KitError, MatchLine, Range, TextOptions, MAX_LINES};
 use grep_matcher::Matcher;
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
-use ignore::overrides::OverrideBuilder;
+use ignore::overrides::{Override, OverrideBuilder};
 use ignore::{DirEntry, ParallelVisitor, ParallelVisitorBuilder, WalkBuilder, WalkState};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -35,8 +39,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// The most matching lines over all files (`maxMatches`).
-const MATCHES_MAX: usize = 2_000;
 /// How long a search may take (`timeoutMs`, 10 s).
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// The longest line kept, in UTF-16 units.
@@ -44,16 +46,45 @@ const LINE_MAX: usize = 400;
 /// How much of a cut line is kept before its first match.
 const LINE_LEAD: usize = 80;
 
-/// Lines under `root` matching `options.query`, one entry per file.
-pub fn search_text(root: &Path, options: &TextOptions) -> Result<Vec<FileMatch>, KitError> {
+/// Lines in `target` (every file under a folder, or the one file) matching
+/// `options.query`, one entry per file.
+pub fn search_text(target: &Target, options: &TextOptions) -> Result<Vec<FileMatch>, KitError> {
     if options.query.is_empty() {
         return Ok(Vec::new());
     }
     let deadline = Instant::now() + SEARCH_TIMEOUT;
     let matcher = matcher_for(options)?;
-    let builder = walk(root, &options.globs)?;
-    let found = search_all(root, builder, &matcher, options.max_files, deadline);
-    answer(found, options.max_files)
+    let max_lines = options.max_lines.clamp(1, MAX_LINES.max);
+    let found = match target {
+        Target::Folder(root) => {
+            let builder = walk(root, &options.globs)?;
+            search_all(root, builder, &matcher, options.max_files, max_lines, deadline)
+        }
+        Target::File { file, name } => search_one(file, name, &matcher, max_lines, deadline),
+    };
+    answer(found, options.max_files, max_lines)
+}
+
+/// The one file `file`, answered as `name`.
+fn search_one(file: &Path, name: &str, matcher: &RegexMatcher, max_lines: usize, deadline: Instant) -> Found {
+    let mut sink = LineSink {
+        matcher,
+        lines: Vec::new(),
+        max_lines,
+        deadline,
+        timed_out: false,
+    };
+    // A file that cannot be read has no match, as rg's walk skips it.
+    let _ = searcher().search_path(matcher, file, &mut sink);
+    let mut files = Vec::new();
+    if !sink.lines.is_empty() {
+        // A walk key of one part: the name, as `key_path` gives it back.
+        files.push((Arc::from(name.as_bytes().to_vec().into_boxed_slice()), sink.lines));
+    }
+    Found {
+        files,
+        timed_out: sink.timed_out,
+    }
 }
 
 // ── Inputs ──────────────────────────────────────────────────────────────────
@@ -86,14 +117,23 @@ fn matcher_for(options: &TextOptions) -> Result<RegexMatcher, KitError> {
 /// The walk of the files to search: list_files' walk narrowed by `globs`.
 fn walk(root: &Path, globs: &[String]) -> Result<WalkBuilder, KitError> {
     let mut builder = files::walker(root);
-    if !globs.is_empty() {
-        let mut overrides = OverrideBuilder::new(root);
-        for glob in globs {
-            overrides.add(glob).map_err(glob_error)?;
-        }
-        builder.overrides(overrides.build().map_err(glob_error)?);
+    if let Some(overrides) = overrides(root, globs)? {
+        builder.overrides(overrides);
     }
     Ok(builder)
+}
+
+/// `globs` as ripgrep's `--glob` reads them, for a walk of `root`; None
+/// when there are none. Shared with search_structural.
+pub(crate) fn overrides(root: &Path, globs: &[String]) -> Result<Option<Override>, KitError> {
+    if globs.is_empty() {
+        return Ok(None);
+    }
+    let mut overrides = OverrideBuilder::new(root);
+    for glob in globs {
+        overrides.add(glob).map_err(glob_error)?;
+    }
+    Ok(Some(overrides.build().map_err(glob_error)?))
 }
 
 fn glob_error(error: ignore::Error) -> KitError {
@@ -102,7 +142,7 @@ fn glob_error(error: ignore::Error) -> KitError {
 
 // ── Searching ───────────────────────────────────────────────────────────────
 
-/// One file's search: its matching lines, at most [`MATCHES_MAX`].
+/// One file's search: its matching lines, at most `max_lines`.
 type Lines = Vec<MatchLine>;
 
 /// What the search found: the files with a matching line, in walk order,
@@ -117,6 +157,7 @@ struct Shared<'a> {
     root: &'a Path,
     matcher: &'a RegexMatcher,
     max_files: usize,
+    max_lines: usize,
     deadline: Instant,
     /// Set when `lwk serve`'s caller cancelled the search.
     cancel: files::Cancel,
@@ -130,7 +171,7 @@ struct Shared<'a> {
 
 impl Shared<'_> {
     /// Count a file found: once the files found up to some file hold more
-    /// than `max_files` files or [`MATCHES_MAX`] lines, any file found
+    /// than `max_files` files or `max_lines` lines, any file found
     /// later can only come before it, so nothing after it in walk order
     /// can be in the answer, and that file becomes the cutoff.
     fn settle(&self, key: &WalkKey, lines: usize) {
@@ -142,7 +183,7 @@ impl Shared<'_> {
         for (key, lines) in settled.iter() {
             files += 1;
             matches += lines;
-            if files > self.max_files || matches >= MATCHES_MAX {
+            if files > self.max_files || matches >= self.max_lines {
                 cut = Some(key.clone());
                 break;
             }
@@ -161,12 +202,14 @@ fn search_all(
     builder: WalkBuilder,
     matcher: &RegexMatcher,
     max_files: usize,
+    max_lines: usize,
     deadline: Instant,
 ) -> Found {
     let shared = Shared {
         root,
         matcher,
         max_files,
+        max_lines,
         deadline,
         cancel: files::Cancel::current(),
         timed_out: AtomicBool::new(false),
@@ -241,6 +284,7 @@ impl ParallelVisitor for Worker<'_> {
         let mut sink = LineSink {
             matcher: &self.matcher,
             lines: Vec::new(),
+            max_lines: shared.max_lines,
             deadline: shared.deadline,
             timed_out: false,
         };
@@ -284,6 +328,7 @@ fn searcher() -> Searcher {
 struct LineSink<'m> {
     matcher: &'m RegexMatcher,
     lines: Lines,
+    max_lines: usize,
     deadline: Instant,
     timed_out: bool,
 }
@@ -295,7 +340,7 @@ impl Sink for LineSink<'_> {
         if let Some(line) = to_line(self.matcher, found)? {
             self.lines.push(line);
         }
-        if self.lines.len() >= MATCHES_MAX {
+        if self.lines.len() >= self.max_lines {
             return Ok(false);
         }
         if Instant::now() >= self.deadline {
@@ -394,9 +439,9 @@ fn is_low_surrogate(unit: u16) -> bool {
 // ── The answer ──────────────────────────────────────────────────────────────
 
 /// The files found, in walk order, cut as the app cuts its stream: a file
-/// past `max_files`, the [`MATCHES_MAX`]th line, or the time running out
-/// mark the last file kept `truncated`.
-fn answer(found: Found, max_files: usize) -> Result<Vec<FileMatch>, KitError> {
+/// past `max_files`, the `max_lines`th line, or the time running out mark
+/// the last file kept `truncated`.
+fn answer(found: Found, max_files: usize, max_lines: usize) -> Result<Vec<FileMatch>, KitError> {
     let mut out: Vec<FileMatch> = Vec::new();
     let mut matches = 0usize;
     for (key, lines) in found.files {
@@ -415,7 +460,7 @@ fn answer(found: Found, max_files: usize) -> Result<Vec<FileMatch>, KitError> {
         for line in lines {
             current.lines.push(line);
             matches += 1;
-            if matches >= MATCHES_MAX {
+            if matches >= max_lines {
                 current.truncated = true;
                 return Ok(out);
             }
@@ -448,6 +493,7 @@ mod tests {
             let mut sink = LineSink {
                 matcher: &matcher,
                 lines: Vec::new(),
+                max_lines: options.max_lines,
                 deadline: Instant::now() + SEARCH_TIMEOUT,
                 timed_out: false,
             };
@@ -457,7 +503,7 @@ mod tests {
                 files.push((Arc::from(key), sink.lines));
             }
         }
-        answer(Found { files, timed_out: false }, options.max_files).unwrap()
+        answer(Found { files, timed_out: false }, options.max_files, options.max_lines).unwrap()
     }
 
     fn same(a: &[FileMatch], b: &[FileMatch]) -> bool {
@@ -489,14 +535,70 @@ mod tests {
                     case_sensitive: None,
                     globs: globs.clone(),
                     max_files,
+                    max_lines: MAX_LINES.default,
                 };
                 let want = searched_in_order(&root, &options);
                 for _ in 0..5 {
-                    let got = search_text(&root, &options).unwrap();
+                    let got = search_text(&Target::Folder(root.clone()), &options).unwrap();
                     assert!(same(&got, &want), "limit {max_files}, globs {globs:?}");
                 }
             }
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn options(query: &str) -> TextOptions {
+        TextOptions {
+            query: query.to_owned(),
+            max_files: 50,
+            max_lines: MAX_LINES.default,
+            ..TextOptions::default()
+        }
+    }
+
+    #[test]
+    fn caps_the_lines_over_all_files() {
+        let root = std::env::temp_dir().join(format!("lwk-test-text-lines-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(root.join(name), "x\nx\nx\n").unwrap();
+        }
+        let target = Target::Folder(root.clone());
+        let all = search_text(&target, &options("x")).unwrap();
+        assert_eq!(all.iter().map(|f| f.lines.len()).sum::<usize>(), 9);
+        assert!(!all.last().unwrap().truncated);
+        for max_lines in 1..9 {
+            let got = search_text(&target, &TextOptions { max_lines, ..options("x") }).unwrap();
+            assert_eq!(got.iter().map(|f| f.lines.len()).sum::<usize>(), max_lines);
+            assert!(got.last().unwrap().truncated, "max_lines {max_lines}");
+            assert!(got[..got.len() - 1].iter().all(|f| !f.truncated));
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn searches_one_file_under_its_name() {
+        let root = std::env::temp_dir().join(format!("lwk-test-text-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // Hidden and ignored: named, it is searched all the same, as rg does.
+        std::fs::write(root.join(".gitignore"), ".h.rs\n").unwrap();
+        std::fs::write(root.join(".h.rs"), "one\nneedle\nneedle again\n").unwrap();
+        std::fs::write(root.join("other.rs"), "needle\n").unwrap();
+        let target = Target::File {
+            file: root.join(".h.rs"),
+            name: "shown.rs".to_owned(),
+        };
+        let got = search_text(&target, &TextOptions { globs: vec!["!*.rs".into()], ..options("needle") }).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].path, "shown.rs");
+        assert_eq!(got[0].lines.iter().map(|l| l.line).collect::<Vec<_>>(), vec![2, 3]);
+        assert!(!got[0].truncated);
+        let cut = search_text(&target, &TextOptions { max_lines: 1, ..options("needle") }).unwrap();
+        assert_eq!(cut[0].lines.len(), 1);
+        assert!(cut[0].truncated);
+        assert!(search_text(&target, &options("absent")).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 

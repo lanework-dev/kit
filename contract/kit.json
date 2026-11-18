@@ -1,5 +1,5 @@
 {
-  "version": "1.1.0",
+  "version": "1.2.0",
   "source": "packages/protocol/src/tools/kit.ts (KIT_TOOLS, KIT_TOOL_LIMITS, STRUCTURAL_LANGS)",
   "structuralLangs": [
     "ts",
@@ -46,10 +46,15 @@
       "max": 50
     }
   },
+  "maxLines": {
+    "default": 2000,
+    "min": 1,
+    "max": 2000
+  },
   "tools": [
     {
       "name": "find_files",
-      "description": "Fuzzy-find files by path in a folder, best match first. Respects .gitignore. Returns each file's path, score and the matched character ranges.",
+      "description": "Fuzzy-find files by path in a folder, best match first. Respects .gitignore. Returns each file's path, score and the matched character ranges. `path` must be a folder.",
       "readOnly": true,
       "inputSchema": {
         "type": "object",
@@ -58,9 +63,13 @@
             "type": "string",
             "description": "Part of a file name or path, e.g. `mcp tools`"
           },
+          "path": {
+            "type": "string",
+            "description": "The folder to search, an absolute path (e.g. the repo's root); the working directory when omitted. Not a file"
+          },
           "folder": {
             "type": "string",
-            "description": "The folder to search, an absolute path (e.g. the repo's root); the working directory when omitted"
+            "description": "The older name of `path`, still taken; pass one of the two (both, if different, is invalid)"
           },
           "limit": {
             "type": "integer",
@@ -85,7 +94,7 @@
     },
     {
       "name": "search_text",
-      "description": "Search the contents of a folder's files with ripgrep. Respects .gitignore; skips hidden and binary files. Returns each matching file with its matching lines (1-based) and match ranges; `truncated` marks where the search stopped.",
+      "description": "Search the contents of a folder's files, or of one file, with ripgrep. Respects .gitignore; skips hidden and binary files. Returns each matching file with all its matching lines (1-based) and match ranges, up to `limit` files and `max_lines` lines in total; `truncated` marks where the search stopped.",
       "readOnly": true,
       "inputSchema": {
         "type": "object",
@@ -94,9 +103,13 @@
             "type": "string",
             "description": "A literal string, or a regex when `regex` is true"
           },
+          "path": {
+            "type": "string",
+            "description": "The folder to search, or one file to search alone, an absolute path (e.g. the repo's root); the working directory when omitted. A file's matches are answered under its name"
+          },
           "folder": {
             "type": "string",
-            "description": "The folder to search, an absolute path (e.g. the repo's root); the working directory when omitted"
+            "description": "The older name of `path`, still taken; pass one of the two (both, if different, is invalid)"
           },
           "regex": {
             "type": "boolean",
@@ -115,9 +128,15 @@
           },
           "limit": {
             "type": "integer",
-            "description": "Files returned; default 50",
+            "description": "Files returned, each with all its matching lines, up to `max_lines` lines in total; default 50",
             "minimum": 1,
             "maximum": 200
+          },
+          "max_lines": {
+            "type": "integer",
+            "description": "Matching lines returned in total, over all files; default 2000. The file that reaches it is marked `truncated`",
+            "minimum": 1,
+            "maximum": 2000
           }
         },
         "required": [
@@ -132,7 +151,7 @@
     },
     {
       "name": "search_structural",
-      "description": "Search a folder's code by syntax with an ast-grep pattern, e.g. `console.log($A)`. Respects .gitignore. Returns each matching file with its matching lines and match ranges, as search_text does.",
+      "description": "Search a folder's code, or one file, by syntax with an ast-grep pattern. Respects .gitignore. Returns each matching file with all its matching lines and match ranges, as search_text does, up to `limit` files and `max_lines` lines in total. A pattern is code with metavariables: `$A` matches one node, `$$$A` any number. Examples: TS/JS: `console.log($A)`, `function $F($$$A) { $$$B }`, `$P.then($F)`; Python: `def $F($$$A): $$$B`, `class $C: $$$B`, `print($$$A)`; Rust: `fn $N($$$A) { $$$B }`, `let $V = $E.unwrap();`, `println!($$$A)`; Go: `func $F($$$A) { $$$B }`, `func ($R $T) $M($$$A) { $$$B }`, `type $T struct { $$$F }`. A declaration needs its body: a pattern that does not parse, like `def $F($$$A)`, `fn $N($$$A)` or `impl $T for $U`, is run once more with the body added, and the answer's `note` says so and names what that pattern skips (a return type, `pub`, ...).",
       "readOnly": true,
       "inputSchema": {
         "type": "object",
@@ -141,9 +160,13 @@
             "type": "string",
             "description": "An ast-grep pattern; `$A` matches one node"
           },
+          "path": {
+            "type": "string",
+            "description": "The folder to search, or one file to search alone, an absolute path (e.g. the repo's root); the working directory when omitted. A file's matches are answered under its name"
+          },
           "folder": {
             "type": "string",
-            "description": "The folder to search, an absolute path (e.g. the repo's root); the working directory when omitted"
+            "description": "The older name of `path`, still taken; pass one of the two (both, if different, is invalid)"
           },
           "lang": {
             "type": "string",
@@ -161,11 +184,24 @@
             ],
             "description": "The pattern's language; each file's own, from its extension, when omitted"
           },
+          "globs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "ripgrep globs limiting the files; a leading `!` excludes"
+          },
           "limit": {
             "type": "integer",
-            "description": "Files returned; default 50",
+            "description": "Files returned, each with all its matching lines, up to `max_lines` lines in total; default 50",
             "minimum": 1,
             "maximum": 200
+          },
+          "max_lines": {
+            "type": "integer",
+            "description": "Matching lines returned in total, over all files; default 2000. The file that reaches it is marked `truncated`",
+            "minimum": 1,
+            "maximum": 2000
           }
         },
         "required": [
@@ -176,18 +212,29 @@
       "limits": {
         "default": 50,
         "max": 200
+      },
+      "answer": {
+        "note": {
+          "type": "string",
+          "optional": true,
+          "description": "Set only when the pattern was run with a body added: which pattern was searched, and what that one skips, e.g. \"searched `def $F($$$A): $$$BODY` (added the body the pattern needs; it skips defs with a return annotation; to match those, add `-> $R` before the colon)\""
+        }
       }
     },
     {
       "name": "list_files",
-      "description": "Every file in a folder that ripgrep would search: .gitignore respected, hidden files skipped. Paths in no particular order; `truncated` when cut at the limit.",
+      "description": "Every file in a folder that ripgrep would search: .gitignore respected, hidden files skipped. Paths in no particular order; `truncated` when cut at the limit. `path` must be a folder.",
       "readOnly": true,
       "inputSchema": {
         "type": "object",
         "properties": {
+          "path": {
+            "type": "string",
+            "description": "The folder to search, an absolute path (e.g. the repo's root); the working directory when omitted. Not a file"
+          },
           "folder": {
             "type": "string",
-            "description": "The folder to search, an absolute path (e.g. the repo's root); the working directory when omitted"
+            "description": "The older name of `path`, still taken; pass one of the two (both, if different, is invalid)"
           },
           "limit": {
             "type": "integer",
@@ -220,9 +267,13 @@
             "minimum": 1,
             "maximum": 50
           },
+          "path": {
+            "type": "string",
+            "description": "Only sessions run in this folder (an absolute path, e.g. the repo's root); every folder's when omitted. Not a file"
+          },
           "folder": {
             "type": "string",
-            "description": "Only sessions run in this folder (an absolute path, e.g. the repo's root); every folder's when omitted"
+            "description": "The older name of `path`, still taken; pass one of the two (both, if different, is invalid)"
           }
         },
         "required": [

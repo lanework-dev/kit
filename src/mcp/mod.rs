@@ -3,7 +3,7 @@
 //! (`electron/mcp-kit/server.ts` in the app).
 //!
 //! - Each call goes to the app's kit socket first and runs in-process
-//!   (`engine::run_in`) when no app answers, as `kit.rs` does.
+//!   (`engine::run_noted`) when no app answers, as `kit.rs` does.
 //! - Scope: the working folder at start, and folders under it that a call
 //!   names; never wider. A cwd that is `/` or the home folder searches
 //!   nothing (the engine refuses it).
@@ -26,7 +26,7 @@ const LATEST_PROTOCOL_VERSION: &str = "2025-06-18";
 const KNOWN_PROTOCOL_VERSIONS: [&str; 4] =
     ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
 
-const INSTRUCTIONS: &str = "lanework-kit searches this machine's files and agent conversations: find_files (fuzzy paths), search_text (ripgrep), search_structural (ast-grep patterns), list_files and search_sessions. Every tool runs in the folder you started in, or a folder under it that you pass as `folder`; paths in answers are relative to the folder searched.";
+const INSTRUCTIONS: &str = "lanework-kit searches this machine's files and agent conversations: find_files (fuzzy paths), search_text (ripgrep), search_structural (ast-grep patterns), list_files and search_sessions. Every tool runs in the folder you started in, or a folder under it that you pass as `path` (`folder` is its older name); search_text and search_structural also take one file as `path`. Paths in answers are relative to the folder searched; a file searched alone is answered by its name.";
 
 /// The contract, embedded.
 const CONTRACT: &str = include_str!("../../contract/kit.json");
@@ -150,7 +150,7 @@ impl Session {
             return Err(Rpc::new(INVALID_PARAMS, format!("unknown tool {shown}")));
         };
         Ok(match self.run_tool(name, params.get("arguments")) {
-            Ok(result) => text(&answer_of(name, result), false),
+            Ok((result, note)) => text(&answer_of(name, result, note), false),
             Err(failure) => {
                 if failure.code == engine::types::KitErrorCode::Internal {
                     eprintln!("lanework-kit mcp: {name} failed: {}", failure.message);
@@ -163,9 +163,11 @@ impl Session {
         })
     }
 
-    /// Run `name` socket-first, then in-process.
-    fn run_tool(&self, name: &str, arguments: Option<&Value>) -> Result<Value, KitError> {
-        let args = match arguments {
+    /// Run `name` socket-first, then in-process: its result, and the
+    /// engine's note. A call the app's contract cannot answer
+    /// (`engine::for_socket`) runs in-process only.
+    fn run_tool(&self, name: &str, arguments: Option<&Value>) -> Result<(Value, Option<String>), KitError> {
+        let mut args = match arguments {
             None | Some(Value::Null) => Map::new(),
             Some(Value::Object(map)) => map.clone(),
             Some(_) => return Err(KitError::invalid("arguments must be an object.")),
@@ -175,14 +177,21 @@ impl Session {
             .clone()
             .ok_or_else(|| KitError::internal("The working folder cannot be read."))?;
         let cwd_text = cwd.to_string_lossy().into_owned();
-        let mut wire = args.clone();
-        wire.insert("cwd".into(), Value::String(cwd_text.clone()));
-        // Narrows the app's scope (the cwd's whole project) to the cwd.
-        wire.insert("roots".into(), json!([cwd_text]));
-        match socket::call(name, wire) {
+        // The app (contract 1.1.0) does not fix a pattern: fixed here first.
+        let fixed_note = engine::fix_ahead(name, &mut args, &cwd);
+        let asked = match engine::for_socket(name, &args, &cwd) {
+            Some(mut wire) => {
+                wire.insert("cwd".into(), Value::String(cwd_text.clone()));
+                // Narrows the app's scope (the cwd's whole project) to the cwd.
+                wire.insert("roots".into(), json!([cwd_text]));
+                socket::call(name, wire)
+            }
+            None => socket::Answer::Absent,
+        };
+        match asked {
             socket::Answer::Result(Some(raw)) => {
                 if let Ok(result) = serde_json::from_str::<Value>(raw.get()) {
-                    return Ok(result);
+                    return Ok((result, fixed_note));
                 }
             }
             socket::Answer::Failed(failure) => return Err(failure),
@@ -194,18 +203,24 @@ impl Session {
             home: crate::paths::home_dir().unwrap_or_default(),
             cwd,
         };
-        engine::run_in(name, &Value::Object(args), &ctx)
+        engine::run_noted(name, &Value::Object(args), &ctx)
+            .map(|answered| (answered.result, fixed_note.or(answered.note)))
     }
 }
 
-/// A core result in the answer shape the contract names.
-fn answer_of(name: &str, result: Value) -> Value {
-    match name {
+/// A core result in the answer shape the contract names, with the
+/// engine's note at the top level when there is one.
+fn answer_of(name: &str, result: Value, note: Option<String>) -> Value {
+    let mut answer = match name {
         "find_files" => json!({ "files": result }),
         "search_text" | "search_structural" => json!({ "matches": result }),
         "search_sessions" => json!({ "sessions": result }),
         _ => result,
+    };
+    if let (Some(note), Some(object)) = (note, answer.as_object_mut()) {
+        object.insert("note".into(), Value::String(note));
     }
+    answer
 }
 
 fn text(value: &Value, is_error: bool) -> Value {
@@ -265,6 +280,39 @@ pub fn run() -> i32 {
         let mut out = stdout.lock();
         if writeln!(out, "{answer}").and_then(|()| out.flush()).is_err() {
             return 0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_note_goes_beside_the_matches() {
+        let matches = json!([{ "path": "a.py", "lines": [], "truncated": false }]);
+        assert_eq!(
+            answer_of("search_structural", matches.clone(), None),
+            json!({ "matches": matches })
+        );
+        assert_eq!(
+            answer_of("search_structural", matches.clone(), Some("searched `x`".into())),
+            json!({ "matches": matches, "note": "searched `x`" })
+        );
+    }
+
+    #[test]
+    fn every_tool_takes_path_and_folder() {
+        let session = Session::new();
+        assert_eq!(session.tools.len(), 5);
+        for tool in &session.tools {
+            let properties = &tool["inputSchema"]["properties"];
+            assert!(properties.get("path").is_some(), "{}", tool["name"]);
+            assert!(properties.get("folder").is_some(), "{}", tool["name"]);
+        }
+        let sg = session.tools.iter().find(|t| t["name"] == "search_structural").unwrap();
+        for key in ["globs", "max_lines"] {
+            assert!(sg["inputSchema"]["properties"].get(key).is_some(), "{key}");
         }
     }
 }

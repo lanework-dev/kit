@@ -83,6 +83,12 @@ pub const GLOBS_MAX: usize = 50;
 pub const GLOB_MAX: usize = 500;
 /// The longest folder path taken, in UTF-16 units.
 pub const FOLDER_MAX: usize = 4_096;
+/// `max_lines` (search_text, search_structural): the most matching lines
+/// over all files answered.
+pub const MAX_LINES: Limit = Limit {
+    default: 2_000,
+    max: 2_000,
+};
 
 /// Languages a structural pattern can be written in (`STRUCTURAL_LANGS`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +167,22 @@ pub struct TextOptions {
     pub globs: Vec<String>,
     /// The most files answered.
     pub max_files: usize,
+    /// The most matching lines answered, over all files.
+    pub max_lines: usize,
+}
+
+/// `search_structural`'s input beyond the folder, checked.
+#[derive(Debug, Clone)]
+pub struct StructuralOptions {
+    pub pattern: String,
+    /// The pattern's language; each file's own when None.
+    pub lang: Option<StructuralLang>,
+    /// ripgrep globs; a leading `!` excludes.
+    pub globs: Vec<String>,
+    /// The most files answered.
+    pub max_files: usize,
+    /// The most matching lines answered, over all files.
+    pub max_lines: usize,
 }
 
 /// `search_sessions`'s input, checked.
@@ -178,6 +200,23 @@ pub struct SessionOptions {
 }
 
 // ── Answers ─────────────────────────────────────────────────────────────────
+
+/// A tool's answer, and a note for the caller when the tool changed what
+/// it was asked (search_structural's pattern fix). The note goes beside the
+/// answer: top-level `note` in `--json` and MCP answers, beside `result` in
+/// `lwk serve`'s, on stderr for the CLI.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Answered {
+    pub result: Value,
+    pub note: Option<String>,
+}
+
+/// search_structural's matches, and the note when the pattern was fixed.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct StructuralAnswer {
+    pub files: Vec<FileMatch>,
+    pub note: Option<String>,
+}
 
 /// `[start, end)` UTF-16 offsets.
 pub type Range = [usize; 2];
