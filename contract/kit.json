@@ -1,5 +1,5 @@
 {
-  "version": "1.0.0",
+  "version": "1.1.0",
   "source": "packages/protocol/src/tools/kit.ts (KIT_TOOLS, KIT_TOOL_LIMITS, STRUCTURAL_LANGS)",
   "structuralLangs": [
     "ts",
@@ -12,6 +12,17 @@
     "python",
     "rust",
     "go"
+  ],
+  "errorCodes": [
+    "invalid",
+    "scope",
+    "not_found",
+    "unavailable",
+    "timeout",
+    "aborted",
+    "cancelled",
+    "busy",
+    "internal"
   ],
   "limits": {
     "find_files": {
@@ -56,6 +67,10 @@
             "description": "Files returned; default 50",
             "minimum": 1,
             "maximum": 200
+          },
+          "git": {
+            "type": "boolean",
+            "description": "Rank files with uncommitted changes and recently committed files higher, the way an editor's quick-open does; default false"
           }
         },
         "required": [

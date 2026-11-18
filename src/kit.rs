@@ -46,6 +46,7 @@ fn flag(command: &str, name: &str) -> Option<&'static str> {
         ("grep", "-i" | "--ignore-case") => Some("ignore_case"),
         ("grep", "-s" | "--case-sensitive") => Some("case_sensitive"),
         ("grep", "-g" | "--glob") => Some("globs"),
+        ("find", "--git") => Some("git"),
         ("sg", "--lang") => Some("lang"),
         _ => None,
     }
@@ -137,6 +138,9 @@ fn parse(command: &str, args: &[String]) -> Result<Parsed, String> {
             }
             "lang" => {
                 params.insert("lang".into(), Value::String(value));
+            }
+            "git" => {
+                params.insert("git".into(), Value::Bool(true));
             }
             "regex" => {
                 params.insert("regex".into(), Value::Bool(true));

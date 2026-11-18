@@ -17,13 +17,21 @@
 //! - At most `limit` hits, best first; `ranges` the matched characters as
 //!   UTF-16 `[start, end)` offsets into `path`.
 //!
-//! NOTE: fff also adds frecency, git-status and git-recency boosts and
-//! filters on `status:`; lwk keeps no frecency database and reads no git
-//! state, so those are 0 and every file counts as clean.
+//! - With the `git` input on, fff's git signals too (`git.rs`): 15% of
+//!   frizbee's score for a file with uncommitted changes (modified, staged
+//!   or untracked), one point per recent commit that touched the file, and
+//!   `status:modified|untracked|staged|clean` filtering on the real status.
+//!   Outside a repository, or without a `git` binary, as with `git` off.
+//!
+//! NOTE: With `git` off no git state is read: the boosts are 0 and every
+//! file counts as clean. fff's frecency boosts (file opens, and how long
+//! ago a file with uncommitted changes was written) need its frecency
+//! database, which lwk does not keep: 0 either way.
 
 use super::cache;
 use super::files;
-use super::types::{FileHit, KitError, Range};
+use super::git::{self, Signals};
+use super::types::{FileHit, FindOptions, KitError, Range};
 use globset::{Glob, GlobMatcher};
 use ignore::{DirEntry, ParallelVisitor, ParallelVisitorBuilder, WalkState};
 use neo_frizbee::{Config, Match, Matcher, Scoring, SortStrategy};
@@ -32,23 +40,33 @@ use std::sync::Mutex;
 use std::time::{Instant, UNIX_EPOCH};
 
 /// Files under `root` whose path matches `query`, best first.
-pub fn find_files(root: &Path, query: &str, limit: usize) -> Result<Vec<FileHit>, KitError> {
+pub fn find_files(
+    root: &Path,
+    query: &str,
+    options: &FindOptions,
+) -> Result<Vec<FileHit>, KitError> {
+    let limit = options.limit;
     if limit == 0 {
         return Ok(Vec::new());
     }
     let query = Query::parse(query);
     let paths = listed_files(root);
-    let Some(candidates) = query.filter(&paths) else {
+    let signals = if options.git { git::signals(root) } else { None };
+    let signals = signals.as_ref();
+    let Some(candidates) = query.filter(&paths, signals) else {
         return Ok(Vec::new());
     };
     let parts = query.fuzzy_parts();
     let max_typos = query.max_typos();
     let scored = match &parts {
-        Some(parts) => score(&paths, &candidates, parts, max_typos),
-        // No fuzzy text (only constraints, or one character): every file
-        // scores 0, newest first, as fff's frecency-only ranking with no
-        // frecency.
-        None => candidates.iter().map(|&at| (at, 0)).collect(),
+        Some(parts) => score(&paths, &candidates, parts, max_typos, signals),
+        // No fuzzy text (only constraints, or one character): fff's
+        // frecency-only ranking with no frecency. Every file scores its
+        // recent commits (0 without git), newest first.
+        None => candidates
+            .iter()
+            .map(|&at| (at, signals.map_or(0, |git| git.recency(&paths[at as usize]))))
+            .collect(),
     };
     let ranked = rank(root, &paths, scored, limit);
 
@@ -156,11 +174,20 @@ enum Constraint<'q> {
     PathSegment(&'q str),
     /// `!test`: only ever negated.
     Text(&'q str),
-    /// `status:modified`: true for `clean`, the status of every file here.
-    GitStatus(bool),
+    /// `status:modified`
+    GitStatus(StatusFilter),
     /// `type:rust`: fff parses it and ignores it.
     FileType,
     Not(Box<Constraint<'q>>),
+}
+
+/// fff's `GitStatusFilter`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusFilter {
+    Modified,
+    Untracked,
+    Staged,
+    Clean,
 }
 
 #[derive(Debug)]
@@ -246,8 +273,9 @@ impl<'q> Query<'q> {
     }
 
     /// The candidates (indices into `paths`) that pass every constraint;
-    /// None when constraints leave nothing.
-    fn filter(&self, paths: &[String]) -> Option<Vec<u32>> {
+    /// None when constraints leave nothing. Without `signals` every file
+    /// is clean.
+    fn filter(&self, paths: &[String], signals: Option<&Signals>) -> Option<Vec<u32>> {
         let all = || (0..paths.len() as u32).collect::<Vec<u32>>();
         if self.constraints.is_empty() {
             return Some(all());
@@ -271,7 +299,7 @@ impl<'q> Query<'q> {
                         .constraints
                         .iter()
                         .filter(|c| !matches!(c, Constraint::Extension(_)))
-                        .all(|c| c.matches(path))
+                        .all(|c| c.matches(path, signals))
             })
             .map(|(at, _)| at as u32)
             .collect();
@@ -280,15 +308,23 @@ impl<'q> Query<'q> {
 }
 
 impl Constraint<'_> {
-    fn matches(&self, path: &str) -> bool {
+    fn matches(&self, path: &str, signals: Option<&Signals>) -> bool {
         match self {
             Constraint::Extension(ext) => has_extension(file_name(path), ext),
             Constraint::Glob(glob) => glob.as_ref().is_some_and(|glob| glob.is_match(path)),
             Constraint::PathSegment(segment) => contains_segment(path, segment),
             Constraint::Text(text) => contains_ignore_ascii_case(path, text),
-            Constraint::GitStatus(clean) => *clean,
+            Constraint::GitStatus(filter) => {
+                let status = signals.map(|git| git.status(path)).unwrap_or_default();
+                match filter {
+                    StatusFilter::Modified => status.is_modified(),
+                    StatusFilter::Untracked => status.is_untracked(),
+                    StatusFilter::Staged => status.is_staged(),
+                    StatusFilter::Clean => status.is_clean(),
+                }
+            }
             Constraint::FileType => true,
-            Constraint::Not(inner) => !inner.matches(path),
+            Constraint::Not(inner) => !inner.matches(path, signals),
         }
     }
 }
@@ -356,17 +392,18 @@ fn parse_plain_token(token: &str) -> Option<Constraint<'_>> {
         "type" => Some(Constraint::FileType),
         "status" | "st" | "g" | "git" => {
             if value == "*" {
-                None
-            } else if ["modified", "untracked", "staged"]
-                .iter()
-                .any(|status| status.starts_with(value))
-            {
-                Some(Constraint::GitStatus(false))
-            } else if "clean".starts_with(value) {
-                Some(Constraint::GitStatus(true))
-            } else {
-                None
+                return None;
             }
+            // Any prefix, the first that fits: `s` is staged, `` modified.
+            [
+                ("modified", StatusFilter::Modified),
+                ("untracked", StatusFilter::Untracked),
+                ("staged", StatusFilter::Staged),
+                ("clean", StatusFilter::Clean),
+            ]
+            .into_iter()
+            .find(|(name, _)| name.starts_with(value))
+            .map(|(_, filter)| Constraint::GitStatus(filter))
         }
         _ => None,
     }
@@ -472,8 +509,14 @@ fn threads() -> usize {
 }
 
 /// Each candidate that matches every part (of 2 bytes or more), with its
-/// total score: `(index into paths, total)`.
-fn score(paths: &[String], candidates: &[u32], parts: &[&str], max_typos: u16) -> Vec<(u32, i32)> {
+/// total score: `(index into paths, total)`. `signals` adds the git boosts.
+fn score(
+    paths: &[String],
+    candidates: &[u32],
+    parts: &[&str],
+    max_typos: u16,
+    signals: Option<&Signals>,
+) -> Vec<(u32, i32)> {
     let valid: Vec<&str> = parts.iter().copied().filter(|part| part.len() >= 2).collect();
     let Some(first) = valid.first() else {
         return Vec::new();
@@ -591,7 +634,18 @@ fn score(paths: &[String], candidates: &[u32], parts: &[&str], max_typos: u16) -
                 0
             };
 
+            // Uncommitted changes: 15%. Recent commits: a point each.
+            let (git_status_boost, git_recency_boost) = match signals {
+                Some(git) => (
+                    if git.status(path).is_modified() { base * 15 / 100 } else { 0 },
+                    git.recency(path),
+                ),
+                None => (0, 0),
+            };
+
             let total = base
+                .saturating_add(git_status_boost)
+                .saturating_add(git_recency_boost)
                 .saturating_add(filename_bonus)
                 .saturating_add(path_alignment_bonus);
             (candidates[m.index as usize], total)
@@ -732,13 +786,14 @@ fn merge(mut ranges: Vec<Range>) -> Vec<Range> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::git::tests::Temp;
 
     fn ranked(paths: &[&str], query: &str) -> Vec<String> {
         let paths: Vec<String> = paths.iter().map(|p| (*p).to_owned()).collect();
         let query = Query::parse(query);
-        let candidates = query.filter(&paths).unwrap_or_default();
+        let candidates = query.filter(&paths, None).unwrap_or_default();
         let parts = query.fuzzy_parts().unwrap();
-        let mut scored = score(&paths, &candidates, &parts, query.max_typos());
+        let mut scored = score(&paths, &candidates, &parts, query.max_typos(), None);
         scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         scored.into_iter().map(|(at, _)| paths[at as usize].clone()).collect()
     }
@@ -769,12 +824,109 @@ mod tests {
             .iter()
             .map(|p| (*p).to_owned())
             .collect();
-        assert_eq!(query.filter(&paths), Some(vec![0]));
+        assert_eq!(query.filter(&paths, None), Some(vec![0]));
         // A lone folder is text; a lone extension is a filter.
         assert_eq!(Query::parse("src/").fuzzy, Fuzzy::Text("src/"));
         assert_eq!(Query::parse("*.rs").fuzzy, Fuzzy::Empty);
         assert_eq!(Query::parse("main.rs:12:4").fuzzy, Fuzzy::Text("main.rs"));
         assert_eq!(Query::parse("main.rs(12,4)").fuzzy, Fuzzy::Text("main.rs"));
+    }
+
+    fn found(root: &Path, query: &str, git: bool) -> Vec<(String, i32)> {
+        let options = FindOptions { limit: 50, git };
+        find_files(root, query, &options)
+            .unwrap()
+            .into_iter()
+            .map(|hit| (hit.path, hit.score as i32))
+            .collect()
+    }
+
+    fn names(hits: &[(String, i32)]) -> Vec<&str> {
+        hits.iter().map(|(path, _)| path.as_str()).collect()
+    }
+
+    #[test]
+    fn git_boosts_changed_and_recent_files() {
+        let files = ["a/widget.rs", "b/widget.rs", "c/widget.rs", "d/widget.rs", "e/widget.rs"];
+        let temp = Temp::repo("find-boost", &files);
+        // c: committed twice more. b: modified. d: staged. An untracked f.
+        for round in 0..2 {
+            temp.write("c/widget.rs", &format!("round {round}\n"));
+            temp.git(&["commit", "-q", "-am", "c"]);
+        }
+        temp.write("b/widget.rs", "two\n");
+        temp.write("d/widget.rs", "two\n");
+        temp.git(&["add", "d/widget.rs"]);
+        temp.write("f/widget.rs", "one\n");
+
+        let plain = found(&temp.0, "widget", false);
+        let base = plain[0].1;
+        assert!(plain.iter().all(|(_, score)| *score == base), "{plain:?}");
+        assert_eq!(plain.len(), 6);
+
+        let boosted: std::collections::HashMap<String, i32> = found(&temp.0, "widget", true).into_iter().collect();
+        // Every file is in the seed commit: one point. frizbee's score is
+        // what the 15% is taken of, the file-name bonus is not.
+        let frizbee = {
+            let mut matcher = Matcher::new("widget", &config(&["widget"], 2));
+            i32::from(matcher.match_list_parallel(&["a/widget.rs"], 1)[0].score)
+        };
+        let status = frizbee * 15 / 100;
+        assert!(status > 3);
+        assert_eq!(boosted["a/widget.rs"], base + 1);
+        assert_eq!(boosted["e/widget.rs"], base + 1);
+        assert_eq!(boosted["c/widget.rs"], base + 3);
+        assert_eq!(boosted["b/widget.rs"], base + 1 + status);
+        assert_eq!(boosted["d/widget.rs"], base + 1 + status);
+        assert_eq!(boosted["f/widget.rs"], base + status);
+        let order = found(&temp.0, "widget", true);
+        assert_eq!(names(&order)[2..4], ["f/widget.rs", "c/widget.rs"]);
+
+        // No fuzzy text: recent commits alone order the files.
+        let recent = found(&temp.0, "*.rs", true);
+        assert_eq!(recent[0], ("c/widget.rs".to_owned(), 3));
+        assert_eq!(recent.last().unwrap(), &("f/widget.rs".to_owned(), 0));
+        assert!(found(&temp.0, "*.rs", false).iter().all(|(_, score)| *score == 0));
+    }
+
+    #[test]
+    fn status_filters_read_git() {
+        let files = ["clean.rs", "modified.rs", "staged.rs", "gone.rs"];
+        let temp = Temp::repo("find-status", &files);
+        temp.write("modified.rs", "two\n");
+        temp.write("staged.rs", "two\n");
+        temp.git(&["add", "staged.rs"]);
+        temp.write("untracked.rs", "one\n");
+
+        let sorted = |query: &str, git: bool| {
+            let hits = found(&temp.0, query, git);
+            let mut paths: Vec<String> = hits.into_iter().map(|(path, _)| path).collect();
+            paths.sort();
+            paths
+        };
+        assert_eq!(sorted("status:modified", true), ["modified.rs", "staged.rs", "untracked.rs"]);
+        assert_eq!(sorted("git:m", true), ["modified.rs", "staged.rs", "untracked.rs"]);
+        assert_eq!(sorted("status:untracked", true), ["untracked.rs"]);
+        assert_eq!(sorted("st:s", true), ["staged.rs"]);
+        assert_eq!(sorted("status:clean", true), ["clean.rs", "gone.rs"]);
+        assert_eq!(sorted("!status:clean", true), ["modified.rs", "staged.rs", "untracked.rs"]);
+        assert_eq!(sorted("status:modified rs", true), ["modified.rs", "staged.rs", "untracked.rs"]);
+        assert_eq!(sorted("modified status:clean", true), Vec::<String>::new());
+        // Without git every file is clean, as before.
+        assert_eq!(sorted("status:modified", false), Vec::<String>::new());
+        assert_eq!(sorted("status:clean", false).len(), 5);
+    }
+
+    #[test]
+    fn git_outside_a_repository_changes_nothing() {
+        let temp = Temp::new("find-norepo");
+        for file in ["src/widget.rs", "lib/widgets/mod.rs", "widget/readme.md"] {
+            temp.write(file, "one\n");
+        }
+        for query in ["widget", "*.rs", "status:clean", "wid mod"] {
+            assert_eq!(found(&temp.0, query, true), found(&temp.0, query, false), "{query}");
+        }
+        assert!(found(&temp.0, "status:modified", true).is_empty());
     }
 
     #[test]

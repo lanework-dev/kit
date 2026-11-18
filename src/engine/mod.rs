@@ -12,6 +12,7 @@
 pub mod cache;
 pub mod files;
 pub mod find;
+pub mod git;
 pub mod scope;
 pub mod sessions;
 pub mod structural;
@@ -22,7 +23,7 @@ use crate::paths;
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
 use types::{
-    KitError, Limit, SessionOptions, StructuralLang, TextOptions, Tool, FOLDER_MAX, GLOBS_MAX,
+    FindOptions, KitError, Limit, SessionOptions, StructuralLang, TextOptions, Tool, FOLDER_MAX, GLOBS_MAX,
     GLOB_MAX, QUERY_MAX,
 };
 
@@ -65,8 +66,12 @@ pub fn run_in(tool: &str, params: &Value, ctx: &Context) -> Result<Value, KitErr
     let answer = match tool {
         Tool::FindFiles => {
             let query = text(raw, "query", QUERY_MAX)?;
+            let options = FindOptions {
+                limit,
+                git: flag(raw, "git")?.unwrap_or(false),
+            };
             let root = folder_for(folder, ctx)?;
-            to_value(find::find_files(&root, query, limit)?)
+            to_value(find::find_files(&root, query, &options)?)
         }
         Tool::SearchText => {
             let options = TextOptions {

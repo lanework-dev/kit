@@ -137,6 +137,16 @@ impl StructuralLang {
 
 // ── Inputs the engines take (already checked by the dispatcher) ────────────
 
+/// `find_files`'s input beyond the folder and query, checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FindOptions {
+    /// The most files answered.
+    pub limit: usize,
+    /// Rank files with uncommitted changes and recently committed files
+    /// higher (the `git` input). Read once the ranking lands in find.rs.
+    pub git: bool,
+}
+
 /// `search_text`'s input, checked.
 // Read once the stub streams land (text.rs, sessions/, mcp/).
 #[allow(dead_code)]
@@ -252,6 +262,7 @@ pub struct FileListing {
 /// - `unavailable`: a tool this one needs is missing here.
 /// - `timeout`: the search ran out of time before any match.
 /// - `aborted`: the caller went away.
+/// - `cancelled`: the caller cancelled this call (`lwk serve` only).
 /// - `busy`: too many calls at once (the socket only).
 /// - `internal`: anything else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,18 +273,20 @@ pub enum KitErrorCode {
     Unavailable,
     Timeout,
     Aborted,
+    Cancelled,
     Busy,
     Internal,
 }
 
 impl KitErrorCode {
-    pub const ALL: [KitErrorCode; 8] = [
+    pub const ALL: [KitErrorCode; 9] = [
         KitErrorCode::Invalid,
         KitErrorCode::Scope,
         KitErrorCode::NotFound,
         KitErrorCode::Unavailable,
         KitErrorCode::Timeout,
         KitErrorCode::Aborted,
+        KitErrorCode::Cancelled,
         KitErrorCode::Busy,
         KitErrorCode::Internal,
     ];
@@ -286,6 +299,7 @@ impl KitErrorCode {
             KitErrorCode::Unavailable => "unavailable",
             KitErrorCode::Timeout => "timeout",
             KitErrorCode::Aborted => "aborted",
+            KitErrorCode::Cancelled => "cancelled",
             KitErrorCode::Busy => "busy",
             KitErrorCode::Internal => "internal",
         }
