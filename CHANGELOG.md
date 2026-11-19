@@ -8,6 +8,22 @@ The kit contract (`contract/kit.json`) has its own semantic version, given in ea
 
 ## [Unreleased]
 
+Kit contract: **1.2.0**, unchanged (no input or answer changed shape; only the `find_files` description now mentions hidden files).
+
+### Added
+
+- `LWK_NO_SOCKET=1` (any value but empty or `0`) makes every command (`find`, `grep`, `sg`, `ls`, `sessions`) and every `lwk mcp` tool call run in-process without connecting to the app's `kit.sock`. The Lanework app sets it when it spawns lwk for each search, which would otherwise ask the app back.
+
+### Changed
+
+- `find_files` (`lwk find`) lists hidden files and folders in a git repository, as the app's quick-open (fff) does: `.gitignore` and the other ignore files still apply, and nothing named `.git` is ever listed. Outside a repository hidden files are still skipped, as fff skips them. `list_files`, `search_text` and `search_structural` still skip hidden files; `lwk ls` answers exactly as before. The file-list cache keeps the hidden walk in its own file (`<hash>-hidden.bin`).
+- `lwk mcp` tells agents when to use each tool instead of the shell (`grep -r`, `find`, `ls -R`, `cat`/`head`/`sed -n`), with example structural patterns, that answers are already capped, and to load the tools first when they load on demand.
+
+### Fixed
+
+- `lwk mcp` reports the binary's version in `serverInfo` (it said 0.1.0).
+- `find_files` breaks ties as fff-search 0.11.0 does, with or without `git`: equal files come in fff's file order (files fff can index first, then by folder, then by name), and the page is cut with fff's partial sort. With `git: true` the top 20 of all 10 comparison queries on the Lanework checkout are now the same as the app's. With more than 4,096 matches equal files stay in fff's file order without the partial sort: on trees that big fff's own order of equal files changes from call to call.
+
 ## [0.2.0] - 2026-11-18
 
 Kit contract: **1.2.0** (additive; calls written for 1.0.0 answer as before).

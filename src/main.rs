@@ -83,7 +83,8 @@ under the path as typed. sg runs a declaration pattern that lacks its body
 (def $F($$$A), fn $N($$$A), impl $T, function $F($$$A)) with the body
 added, and says so on stderr.
 
-.gitignore is respected and hidden files are skipped. FOLDER and PATH
+.gitignore is respected. In a git repository find lists hidden files and
+folders too (never .git/); the other commands skip them. FOLDER and PATH
 default to the working folder, and must be inside it unless the Lanework app
 is running and the folder belongs to the same project (a file, --max-lines
 and sg -g run without the app); / and your home folder itself are never
@@ -93,6 +94,11 @@ find and ls keep the folder's file list in a cache ($XDG_CACHE_HOME/lwk,
 else ~/Library/Caches/lwk on macOS or ~/.cache/lwk), checked against the
 folders' and ignore files' change times on every call. LWK_NO_CACHE=1
 turns it off; deleting the folder is always safe.
+
+The tools ask the running Lanework app first, over its socket
+($LANEWORK_HOME/run/kit.sock), and run in-process when it does not answer.
+LWK_NO_SOCKET=1 (any value but empty or 0) never asks it: find, grep, sg, ls,
+sessions and lwk mcp all run in-process.
 ";
 
 /// Write `text` to stdout whole. A closed pipe (`lwk ls | head`) is not an

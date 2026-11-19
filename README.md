@@ -6,6 +6,10 @@ desktop app, on the command line and as an MCP server.
 
 `lwk` asks the running Lanework app first (its warm index). With no app to
 answer, it runs the same tools in-process, in your working folder.
+`LWK_NO_SOCKET=1` (any value but empty or `0`) skips the app: every command,
+`lwk mcp` included, runs in-process without connecting to its socket. The app
+sets it when it spawns lwk for each search, which would otherwise ask the app
+back.
 
 ## Install
 
@@ -49,8 +53,10 @@ lwk COMMAND [ARGS...]          Run any other command unchanged
 
 Options: `--json`, `--limit N`, `--max-lines N`, `--git`, `-E/--regex`,
 `-F/--fixed-strings`, `-i/--ignore-case`, `-s/--case-sensitive`,
-`-g/--glob GLOB`, `--lang LANG` (`lwk help` has the full text). `.gitignore` is respected and hidden files are
-skipped. Exit code: 0 found, 1 nothing found, 2 error.
+`-g/--glob GLOB`, `--lang LANG` (`lwk help` has the full text). `.gitignore` is respected. In a git
+repository `lwk find` lists hidden files and folders too (never `.git/`), as
+the app's quick-open does; the other commands, and `lwk find` outside a
+repository, skip them. Exit code: 0 found, 1 nothing found, 2 error.
 
 ### Ranking by git state: `find --git`
 
