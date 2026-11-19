@@ -116,7 +116,7 @@ fn matcher_for(options: &TextOptions) -> Result<RegexMatcher, KitError> {
 
 /// The walk of the files to search: list_files' walk narrowed by `globs`.
 fn walk(root: &Path, globs: &[String]) -> Result<WalkBuilder, KitError> {
-    let mut builder = files::walker(root);
+    let mut builder = files::walker(root, files::Walk::Files);
     if let Some(overrides) = overrides(root, globs)? {
         builder.overrides(overrides);
     }

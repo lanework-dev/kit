@@ -1,6 +1,8 @@
 //! `list_files`: every file in a folder that ripgrep would search, with
 //! `ignore`'s walker: .gitignore respected, hidden files skipped
 //! (`electron/main/fs-kit/list-files.ts`, which runs `rg --files`).
+//! find_files walks the same way, but in a git work tree keeps hidden
+//! files ([`Walk::Hidden`]).
 //!
 //! - `root` is real and already in scope; paths answered are relative to
 //!   it, `/`-separated, sorted as JavaScript sorts strings (UTF-16 units).
@@ -79,6 +81,18 @@ impl Cancel {
     }
 }
 
+/// Which files a walk gives: the same ignore files either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Walk {
+    /// ripgrep's: hidden files and folders skipped. list_files,
+    /// search_text and search_structural, and find_files outside a git
+    /// work tree.
+    Files,
+    /// fff's in a git work tree (find_files): hidden files and folders
+    /// too, but never a `.git` folder or file, nor anything under one.
+    Hidden,
+}
+
 /// The files under `root`, `.gitignore` respected, sorted.
 ///
 /// The walk is ripgrep's parallel one; the files kept are the first
@@ -90,7 +104,7 @@ impl Cancel {
 /// The files come from the file-list cache ([`cache`]) when it is on; its
 /// answer is the walk's.
 pub fn list_files(root: &Path, max_files: usize) -> Result<FileListing, KitError> {
-    match cache::listing(root) {
+    match cache::listing(root, Walk::Files) {
         Some(listing) => Ok(first_files(listing, max_files)),
         None => list_files_uncached(root, max_files),
     }
@@ -135,7 +149,7 @@ fn list_files_uncached(root: &Path, max_files: usize) -> Result<FileListing, Kit
         cutoff: Cutoff::default(),
         kept: Mutex::new(Vec::new()),
     };
-    walker(root).build_parallel().visit(&mut ListBuilder(&shared));
+    walker(root, Walk::Files).build_parallel().visit(&mut ListBuilder(&shared));
 
     let mut kept = shared.kept.into_inner().unwrap_or_else(|e| e.into_inner());
     let seen = shared.seen.into_inner();
@@ -366,11 +380,16 @@ impl CutoffView {
 }
 
 /// ripgrep's walk of `root`, as `rg --no-config --no-require-git` sets it
-/// up, sorted by name within each folder.
-pub(crate) fn walker(root: &Path) -> WalkBuilder {
+/// up, sorted by name within each folder. [`Walk::Hidden`] keeps hidden
+/// files and folders and drops every entry named `.git`, as fff-search
+/// does in a git work tree (its `is_git_file`).
+pub(crate) fn walker(root: &Path, walk: Walk) -> WalkBuilder {
     let mut builder = WalkBuilder::new(root);
+    if walk == Walk::Hidden {
+        builder.filter_entry(|entry| entry.depth() == 0 || entry.file_name() != ".git");
+    }
     builder
-        .hidden(true)
+        .hidden(walk == Walk::Files)
         .parents(true)
         .ignore(true)
         .git_ignore(true)
@@ -457,7 +476,7 @@ mod tests {
     fn listed_in_order(root: &Path, max_files: usize) -> FileListing {
         let mut files: Vec<String> = Vec::new();
         let mut truncated = false;
-        for entry in walker(root).build() {
+        for entry in walker(root, Walk::Files).build() {
             let Some(path) = file_of(root, entry) else { continue };
             if files.len() >= max_files {
                 truncated = true;
@@ -491,7 +510,7 @@ mod tests {
     #[test]
     fn walk_keys_sort_in_walk_order() {
         let root = tree("keys");
-        let walked: Vec<Vec<u8>> = walker(&root)
+        let walked: Vec<Vec<u8>> = walker(&root, Walk::Files)
             .build()
             .filter_map(|entry| walk_key(&root, entry.ok()?.path()))
             .collect();

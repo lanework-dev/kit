@@ -192,6 +192,12 @@ struct Place {
     common: PathBuf,
 }
 
+/// Whether `root` is in a git work tree: fff's `is_git_repo`, which makes
+/// find_files list hidden files.
+pub(crate) fn in_work_tree(root: &Path) -> bool {
+    discover(root).is_some()
+}
+
 /// The nearest `.git` at or above `start`: a folder with a `HEAD`, or a
 /// file naming a worktree's git folder.
 fn discover(start: &Path) -> Option<Place> {

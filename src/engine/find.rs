@@ -2,15 +2,21 @@
 //! typos forgiven (`electron/main/file-finder/finder.ts`).
 //!
 //! - `root` is real and already in scope; `query` at most `QUERY_MAX`.
-//! - The files are list_files' (`files::walker`, through `cache`): .gitignore respected,
-//!   hidden files skipped.
+//! - The files are fff's: in a git work tree, list_files' walk with hidden
+//!   files and folders too and every `.git` dropped (`files::Walk::Hidden`,
+//!   as fff walks with `hidden(false)` and skips `is_git_file`); outside
+//!   one, list_files' own (hidden skipped, as fff skips them there). The
+//!   ignore files are list_files' either way (`.gitignore`, `.ignore`,
+//!   `.rgignore`, `.git/info/exclude`, the global excludes). Through
+//!   `cache`, which keeps the two walks apart.
 //! - Matched and scored with `neo_frizbee`, the Smith-Waterman matcher fff
 //!   uses, and ranked as fff-search 0.11.0's `FilePicker::fuzzy_search`
 //!   ranks with fff-node's defaults (`score.rs`, `match_and_score_in_arena`):
 //!   frizbee's path score, a bonus when the match lands in the file name
 //!   (40% exact, up to 16% fuzzy, 5% for entry points like `mod.rs`), a
 //!   path-alignment bonus for queries with a `/`, ties broken by newest
-//!   mtime. `score` is that total, higher is better.
+//!   mtime and then as fff breaks them (`rank`: its file order, and its
+//!   partial sort). `score` is that total, higher is better.
 //! - The query is parsed as fff's `QueryParser` parses it: whitespace-split
 //!   parts, each scored and averaged; `*.ext`, globs, `dir/`, `/dir`,
 //!   `!exclude` and `file:12` suffixes as fff reads them.
@@ -27,6 +33,12 @@
 //! file counts as clean. fff's frecency boosts (file opens, and how long
 //! ago a file with uncommitted changes was written) need its frecency
 //! database, which lwk does not keep: 0 either way.
+//!
+//! NOTE: The app's fff-node is built with fff's zlob walker, which reads
+//! `.gitignore` and `.ignore` but not `.rgignore` or `.git/info/exclude`:
+//! a file only those exclude is listed by the app and not here. Outside a
+//! git work tree fff also skips `node_modules`, `.venv`, `target/debug`
+//! and its other `IGNORED_DIRS`; lwk does not.
 
 use super::cache;
 use super::files;
@@ -50,7 +62,7 @@ pub fn find_files(
         return Ok(Vec::new());
     }
     let query = Query::parse(query);
-    let paths = listed_files(root);
+    let paths = listed_files(root, walk_kind(root));
     let signals = if options.git { git::signals(root) } else { None };
     let signals = signals.as_ref();
     let Some(candidates) = query.filter(&paths, signals) else {
@@ -88,24 +100,34 @@ pub fn find_files(
 
 // ── The files ───────────────────────────────────────────────────────────────
 
-/// Every file list_files would give, sorted as it sorts them, from the
-/// file-list cache when it is on. A walk that runs out of
-/// `files::WALK_TIMEOUT` keeps what it found.
-fn listed_files(root: &Path) -> Vec<String> {
-    match cache::listing(root) {
-        Some(listing) => listing.files,
-        None => listed_files_uncached(root),
+/// Which walk find_files takes in `root`: hidden files too in a git work
+/// tree, as fff's.
+pub(crate) fn walk_kind(root: &Path) -> files::Walk {
+    if git::in_work_tree(root) {
+        files::Walk::Hidden
+    } else {
+        files::Walk::Files
     }
 }
 
-fn listed_files_uncached(root: &Path) -> Vec<String> {
+/// Every file `kind` walks, sorted as list_files sorts them, from the
+/// file-list cache when it is on. A walk that runs out of
+/// `files::WALK_TIMEOUT` keeps what it found.
+fn listed_files(root: &Path, kind: files::Walk) -> Vec<String> {
+    match cache::listing(root, kind) {
+        Some(listing) => listing.files,
+        None => listed_files_uncached(root, kind),
+    }
+}
+
+fn listed_files_uncached(root: &Path, kind: files::Walk) -> Vec<String> {
     let found = Mutex::new(Vec::new());
     let mut builder = Collector {
         root,
         deadline: Instant::now() + files::WALK_TIMEOUT,
         found: &found,
     };
-    files::walker(root).build_parallel().visit(&mut builder);
+    files::walker(root, kind).build_parallel().visit(&mut builder);
     let mut paths = found.into_inner().unwrap_or_else(|poison| poison.into_inner());
     files::sort_js(&mut paths);
     paths
@@ -676,51 +698,164 @@ fn is_entry_point(name: &str) -> bool {
     )
 }
 
-/// The best `limit`: total descending, then newest mtime (whole seconds,
-/// as fff keeps it), then path. Only the files that can make the page are
-/// stat'ed.
-fn rank(root: &Path, paths: &[String], mut scored: Vec<(u32, i32)>, limit: usize) -> Vec<(u32, i32)> {
-    scored.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    if scored.len() > limit {
-        let cut = scored[limit - 1].1;
-        let end = scored.partition_point(|&(_, total)| total >= cut);
-        scored.truncate(end);
-    }
-    let times = modified(root, paths, &scored);
-    let mut order: Vec<usize> = (0..scored.len()).collect();
-    order.sort_unstable_by(|&a, &b| {
-        scored[b].1
-            .cmp(&scored[a].1)
-            .then(times[b].cmp(&times[a]))
-            .then(scored[a].0.cmp(&scored[b].0))
-    });
-    order.truncate(limit);
-    order.into_iter().map(|at| scored[at]).collect()
+/// What fff knows of a file from its walk and ranks by: whether it can
+/// index the file, and its mtime in whole seconds.
+#[derive(Debug, Clone, Copy, Default)]
+struct Meta {
+    indexable: bool,
+    mtime: u64,
 }
 
-/// Each file's mtime in seconds, 0 when it cannot be read.
-fn modified(root: &Path, paths: &[String], files: &[(u32, i32)]) -> Vec<u64> {
-    let stat = |&(at, _): &(u32, i32)| -> u64 {
-        std::fs::metadata(root.join(&paths[at as usize]))
-            .and_then(|meta| meta.modified())
-            .ok()
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map_or(0, |since| since.as_secs())
+/// fff's `MAX_INDEXABLE_FILE_SIZE`.
+const MAX_INDEXABLE: u64 = 2 * 1024 * 1024;
+
+/// `path`'s [`Meta`]: indexable when fff's walk (zlob, as the app's
+/// fff-node is built) does not take it for binary by its extension and it
+/// holds 1 byte to 2 MiB. A file that cannot be read is neither.
+fn meta(path: &Path, name: &str) -> Meta {
+    let Ok(stat) = std::fs::metadata(path) else {
+        return Meta::default();
     };
-    if files.len() < 512 {
-        return files.iter().map(stat).collect();
+    let mtime = stat
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_secs());
+    let size = stat.len();
+    Meta {
+        indexable: !is_binary_name(name) && size > 0 && size <= MAX_INDEXABLE,
+        mtime,
     }
-    let chunk = files.len().div_ceil(threads().min(8));
+}
+
+/// Each scored file's [`Meta`], in parallel when there are many.
+fn metas(root: &Path, paths: &[String], scored: &[(u32, i32)]) -> Vec<Meta> {
+    let one = |&(at, _): &(u32, i32)| {
+        let path = &paths[at as usize];
+        meta(&root.join(path), file_name(path))
+    };
+    if scored.len() < 512 {
+        return scored.iter().map(one).collect();
+    }
+    let chunk = scored.len().div_ceil(threads().min(8));
     std::thread::scope(|scope| {
-        let handles: Vec<_> = files
+        let handles: Vec<_> = scored
             .chunks(chunk)
-            .map(|part| scope.spawn(move || part.iter().map(stat).collect::<Vec<u64>>()))
+            .map(|part| scope.spawn(move || part.iter().map(one).collect::<Vec<Meta>>()))
             .collect();
         handles
             .into_iter()
             .flat_map(|handle| handle.join().unwrap_or_default())
             .collect()
     })
+}
+
+/// fff's file order, which its matches come in (`walk_filesystem`):
+/// indexable files first, then by folder, then by file name, byte by byte.
+fn fff_order(a: (&str, Meta), b: (&str, Meta)) -> std::cmp::Ordering {
+    let (a_dir, a_name) = a.0.split_at(filename_offset(a.0));
+    let (b_dir, b_name) = b.0.split_at(filename_offset(b.0));
+    b.1.indexable
+        .cmp(&a.1.indexable)
+        .then_with(|| a_dir.cmp(b_dir))
+        .then_with(|| a_name.cmp(b_name))
+}
+
+/// fff's `is_known_binary_extension_basename`: the extension, as
+/// `Path::extension` reads it (a dotfile with no other dot has none),
+/// is one fff knows for binary. Case counts.
+fn is_binary_name(name: &str) -> bool {
+    let ext = match name.rfind('.') {
+        Some(at) if at > 0 && at < name.len() - 1 => &name[at + 1..],
+        _ => return false,
+    };
+    matches!(
+        ext,
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "ico" | "webp" | "tiff" | "tif" | "avif"
+            | "heic" | "heif" | "jxl" | "jp2" | "j2k" | "psd" | "icns" | "cur" | "cr2"
+            | "nef" | "dng" | "tga"
+            | "rgbe" | "hdr" | "exr" | "dds" | "ktx" | "ktx2" | "pvr" | "astc"
+            | "ai" | "webarchive" | "mhtml"
+            | "mp4" | "avi" | "mov" | "wmv" | "mkv" | "mp3" | "wav" | "flac" | "ogg" | "m4a"
+            | "aac" | "webm" | "flv" | "mpg" | "mpeg" | "wma" | "opus" | "pcm" | "reapeaks"
+            | "zip" | "tar" | "gz" | "bz2" | "xz" | "7z" | "rar" | "zst" | "lz4" | "lzma"
+            | "cab" | "cpio" | "jsonlz4"
+            | "deb" | "rpm" | "apk" | "dmg" | "msi" | "iso" | "nupkg" | "whl" | "egg"
+            | "appimage" | "flatpak" | "crx" | "pak"
+            | "exe" | "dll" | "so" | "dylib" | "o" | "a" | "lib" | "bin" | "elf"
+            | "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx"
+            | "db" | "sqlite" | "sqlite3" | "mdb"
+            | "sqlite-wal" | "sqlite-shm" | "sqlite3-wal" | "sqlite3-shm"
+            | "db-wal" | "db-shm" | "ldb"
+            | "ttf" | "otf" | "woff" | "woff2" | "eot"
+            | "class" | "pyc" | "pyo" | "wasm" | "dex" | "jar" | "war"
+            | "cmi" | "cmt" | "cmti" | "cmx" | "nib"
+            | "swiftdeps" | "swiftdeps~" | "swiftdoc" | "swiftmodule" | "swiftsourceinfo"
+            | "npy" | "npz" | "h5" | "hdf5" | "pt" | "onnx"
+            | "safetensors" | "tfrecord" | "tflite" | "gguf" | "ggml" | "joblib"
+            | "glb" | "blend" | "blp"
+            | "dia" | "bcmap"
+            | "pb"
+            | "parquet" | "arrow"
+            | "suo"
+    )
+}
+
+/// Up to this many matches [`rank`] reproduces fff's order of equal files
+/// too; above it, where fff's own order of them varies, it only keeps them
+/// in fff's file order.
+const EXACT_TIES_MAX: usize = 4096;
+
+/// The best `limit` of `scored`, as fff-search 0.11.0's
+/// `sort_and_paginate` picks them: total descending, then newest mtime.
+///
+/// - The matches are put in fff's file order first ([`fff_order`]), the
+///   order fff's matches come in.
+/// - When fewer than half the matches are wanted and there are more than
+///   100, fff first moves the best `limit` to the front with
+///   `select_nth_unstable_by` and drops the rest; the stable sort that
+///   follows keeps the order that left among files equal in both. Up to
+///   [`EXACT_TIES_MAX`] matches the same calls run here, on the same
+///   order, and leave the same order: every match is stat'ed for it.
+/// - Above that, only the files whose total can make the page are stat'ed
+///   and sorted, equal ones left in fff's file order.
+///
+/// NOTE: fff matches with frizbee's threads, one per 2,000 files searched,
+/// and joins their matches thread by thread in the order the threads took
+/// their chunks. With more than one thread that order varies from call to
+/// call, and so does fff's order of equal files (on a 32,000-file tree,
+/// every call): no order can match it there. Here equal files always come
+/// in the order fff gives with one thread.
+fn rank(root: &Path, paths: &[String], mut scored: Vec<(u32, i32)>, limit: usize) -> Vec<(u32, i32)> {
+    let wanted = limit.min(scored.len());
+    if wanted == 0 {
+        return Vec::new();
+    }
+    let matched = scored.len();
+    let exact = matched <= EXACT_TIES_MAX;
+    if !exact {
+        // Only the files that can make the page.
+        scored.sort_unstable_by_key(|&(_, total)| std::cmp::Reverse(total));
+        let cut = scored[wanted - 1].1;
+        let end = scored.partition_point(|&(_, total)| total >= cut);
+        scored.truncate(end);
+    }
+    let metas = metas(root, paths, &scored);
+    let mut items: Vec<(u32, i32, Meta)> = scored
+        .into_iter()
+        .zip(metas)
+        .map(|((at, total), meta)| (at, total, meta))
+        .collect();
+    items.sort_unstable_by(|a, b| fff_order((&paths[a.0 as usize], a.2), (&paths[b.0 as usize], b.2)));
+    let best_first =
+        |a: &(u32, i32, Meta), b: &(u32, i32, Meta)| b.1.cmp(&a.1).then_with(|| b.2.mtime.cmp(&a.2.mtime));
+    if exact && wanted < matched / 2 && matched > 100 {
+        items.select_nth_unstable_by(wanted - 1, best_first);
+        items.truncate(wanted);
+    }
+    items.sort_by(best_first);
+    items.truncate(wanted);
+    items.into_iter().map(|(at, total, _)| (at, total)).collect()
 }
 
 // ── Ranges ──────────────────────────────────────────────────────────────────
@@ -830,6 +965,85 @@ mod tests {
         assert_eq!(Query::parse("*.rs").fuzzy, Fuzzy::Empty);
         assert_eq!(Query::parse("main.rs:12:4").fuzzy, Fuzzy::Text("main.rs"));
         assert_eq!(Query::parse("main.rs(12,4)").fuzzy, Fuzzy::Text("main.rs"));
+    }
+
+    #[test]
+    fn binary_names_as_fff_reads_them() {
+        assert!(is_binary_name("icon.png"));
+        assert!(is_binary_name("a.b.sqlite-wal"));
+        assert!(!is_binary_name("icon.PNG"));
+        assert!(!is_binary_name(".png"));
+        assert!(!is_binary_name("png."));
+        assert!(!is_binary_name("main.rs"));
+    }
+
+    #[test]
+    fn fff_order_is_indexable_then_folder_then_name() {
+        let text = Meta { indexable: true, mtime: 0 };
+        let binary = Meta { indexable: false, mtime: 0 };
+        let mut paths = [
+            ("a/b/c.ts", text),
+            ("a/z.ts", text),
+            ("a-x/f.ts", text),
+            ("a/icon.png", binary),
+            ("z.ts", text),
+        ];
+        paths.sort_by(|a, b| fff_order(*a, *b));
+        let order: Vec<&str> = paths.iter().map(|(path, _)| *path).collect();
+        // The root's files first, a folder's files before its subfolders'.
+        assert_eq!(order, vec!["z.ts", "a-x/f.ts", "a/z.ts", "a/b/c.ts", "a/icon.png"]);
+    }
+
+    #[test]
+    fn equal_files_rank_in_fff_order() {
+        let temp = Temp::new("find-ties");
+        let names = ["b/widget.ts", "a/b/widget.ts", "a/widget.ts", "a/widget.png", "a/empty/widget.ts"];
+        for name in names {
+            temp.write(name, if name.contains("empty") { "" } else { "x" });
+        }
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        for name in names {
+            let file = std::fs::File::options().write(true).open(temp.0.join(name)).unwrap();
+            file.set_modified(when).unwrap();
+        }
+        let paths: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+        let scored: Vec<(u32, i32)> = (0..paths.len() as u32).map(|at| (at, 10)).collect();
+        let ranked: Vec<&str> = rank(&temp.0, &paths, scored, 10)
+            .into_iter()
+            .map(|(at, _)| paths[at as usize].as_str())
+            .collect();
+        // An empty file and a binary one are not indexable: last, in the
+        // same folder-then-name order.
+        assert_eq!(
+            ranked,
+            vec!["a/widget.ts", "a/b/widget.ts", "b/widget.ts", "a/widget.png", "a/empty/widget.ts"]
+        );
+    }
+
+    #[test]
+    fn hidden_files_only_in_a_work_tree() {
+        let temp = Temp::new("find-hidden");
+        for name in [".hidden/note.txt", ".github/ci.yml", ".secret/note.txt", "src/note.txt", ".env"] {
+            temp.write(name, "x");
+        }
+        temp.write(".gitignore", ".secret/\n");
+        let all = |root: &Path| {
+            let mut paths = names(&found(root, "", false)).iter().map(|p| (*p).to_owned()).collect::<Vec<_>>();
+            paths.sort();
+            paths
+        };
+        // Outside a work tree, hidden files are skipped, as fff skips them.
+        assert_eq!(all(&temp.0), vec!["src/note.txt"]);
+        temp.git(&["init", "-q", "-b", "main"]);
+        for _ in 0..2 {
+            assert_eq!(
+                all(&temp.0),
+                vec![".env", ".github/ci.yml", ".gitignore", ".hidden/note.txt", "src/note.txt"]
+            );
+        }
+        // list_files is unchanged.
+        let listed = files::list_files(&temp.0, 100).unwrap().files;
+        assert_eq!(listed, vec!["src/note.txt"]);
     }
 
     fn found(root: &Path, query: &str, git: bool) -> Vec<(String, i32)> {

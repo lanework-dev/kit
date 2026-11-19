@@ -3,8 +3,12 @@
 //! untracked cache.
 //!
 //! - Where: `$XDG_CACHE_HOME/lwk`, else `~/Library/Caches/lwk` (macOS) or
-//!   `~/.cache/lwk`; one file per real root, named by a hash of its path.
-//!   `LWK_NO_CACHE=1` turns the cache off, reading and writing.
+//!   `~/.cache/lwk`; one file per real root and walk, named by a hash of
+//!   its path: `<hash>.bin` for list_files' walk ([`files::Walk::Files`]),
+//!   `<hash>-hidden.bin` for find_files' walk in a git work tree
+//!   ([`files::Walk::Hidden`]), whose env key also says so. The two never
+//!   share a file. `LWK_NO_CACHE=1` turns the cache off, reading and
+//!   writing.
 //! - What: every folder the walk ([`files::walker`]) went into, with its
 //!   mtime, ctime and inode; the files in it; and every ignore source the
 //!   walk consulted: `.gitignore`, `.ignore`, `.rgignore` and `.git` in each
@@ -48,7 +52,7 @@
 //!       size var, ino var
 //! ```
 
-use super::files;
+use super::files::{self, Walk as WalkKind};
 use ignore::{DirEntry, ParallelVisitor, ParallelVisitorBuilder, WalkState};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
@@ -74,13 +78,14 @@ pub(crate) struct Listing {
     pub complete: bool,
 }
 
-/// `root`'s files from the cache, brought up to date; None when the cache
-/// is off for `root` and the caller walks it uncached.
-pub(crate) fn listing(root: &Path) -> Option<Listing> {
+/// `root`'s files as `kind` walks them, from the cache, brought up to
+/// date; None when the cache is off for `root` and the caller walks it
+/// uncached.
+pub(crate) fn listing(root: &Path, kind: WalkKind) -> Option<Listing> {
     let settings = settings()?;
     let found = match RAM.get() {
-        Some(ram) => ram.listing_with(root, &settings),
-        None => listing_with(root, &settings),
+        Some(ram) => ram.listing_with(root, &settings, kind),
+        None => listing_with(root, &settings, kind),
     };
     found.map(|(listing, _)| listing)
 }
@@ -141,6 +146,7 @@ struct Ram {
 
 struct Kept {
     root: PathBuf,
+    kind: WalkKind,
     used: Instant,
     /// Locked for the whole of a call's check: two calls on one root check
     /// one after the other. None until a walk ends whole.
@@ -336,13 +342,14 @@ impl Ram {
         }
     }
 
-    /// `root`'s place, made if need be; the root unused the longest goes
-    /// when there are too many, and any unused for [`RAM_UNUSED_FOR`].
-    fn place(&self, root: &Path) -> Arc<Mutex<Option<Held>>> {
+    /// `root`'s place for `kind`'s walk, made if need be; the one unused
+    /// the longest goes when there are too many, and any unused for
+    /// [`RAM_UNUSED_FOR`].
+    fn place(&self, root: &Path, kind: WalkKind) -> Arc<Mutex<Option<Held>>> {
         let now = Instant::now();
         let mut roots = self.roots.lock().unwrap_or_else(|e| e.into_inner());
         roots.retain(|kept| now.duration_since(kept.used) < RAM_UNUSED_FOR);
-        if let Some(kept) = roots.iter_mut().find(|kept| kept.root == root) {
+        if let Some(kept) = roots.iter_mut().find(|kept| kept.root == root && kept.kind == kind) {
             kept.used = now;
             return kept.held.clone();
         }
@@ -355,6 +362,7 @@ impl Ram {
         let held = Arc::new(Mutex::new(None));
         roots.push(Kept {
             root: root.to_path_buf(),
+            kind,
             used: now,
             held: held.clone(),
         });
@@ -362,11 +370,11 @@ impl Ram {
     }
 
     /// [`listing_with`], from the cache held for `root` when there is one.
-    fn listing_with(&self, root: &Path, settings: &Settings) -> Option<(Listing, Outcome)> {
+    fn listing_with(&self, root: &Path, settings: &Settings, kind: WalkKind) -> Option<(Listing, Outcome)> {
         let files = |cache: &Cache| cache.files.iter().map(|file| file.path.clone()).collect();
-        let place = self.place(root);
+        let place = self.place(root, kind);
         let mut held = place.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(kept) = held.as_ref().filter(|kept| kept.usable(bytes_of(root.as_os_str()), &env_key())) {
+        if let Some(kept) = held.as_ref().filter(|kept| kept.usable(bytes_of(root.as_os_str()), &env_key(kind))) {
             let check = self.crew.start(kept);
             // Inside `checked_meanwhile` the caller goes on with these
             // files and hears of the check there.
@@ -383,7 +391,7 @@ impl Ram {
             }
         }
         let old = held.take().map(|kept| kept.cache);
-        let (cache, outcome) = refresh(root, settings, old)?;
+        let (cache, outcome) = refresh(root, settings, old, kind)?;
         let listing = Listing {
             files: files(&cache),
             complete: outcome != Outcome::Partial,
@@ -463,8 +471,8 @@ pub(crate) enum Outcome {
     Partial,
 }
 
-pub(crate) fn listing_with(root: &Path, settings: &Settings) -> Option<(Listing, Outcome)> {
-    let (cache, outcome) = refresh(root, settings, None)?;
+pub(crate) fn listing_with(root: &Path, settings: &Settings, kind: WalkKind) -> Option<(Listing, Outcome)> {
+    let (cache, outcome) = refresh(root, settings, None, kind)?;
     let complete = outcome != Outcome::Partial;
     let files = cache.files.into_iter().map(|file| file.path).collect();
     Some((Listing { files, complete }, outcome))
@@ -473,15 +481,15 @@ pub(crate) fn listing_with(root: &Path, settings: &Settings) -> Option<(Listing,
 /// `root`'s cache brought up to date, and what that took: `held` (the one
 /// a long-lived process kept) when it is this root's, else the cache file.
 /// None when the cache is off for `root`.
-fn refresh(root: &Path, settings: &Settings, held: Option<Cache>) -> Option<(Cache, Outcome)> {
+fn refresh(root: &Path, settings: &Settings, held: Option<Cache>, kind: WalkKind) -> Option<(Cache, Outcome)> {
     if !cfg!(unix) || too_broad(root) {
         return None;
     }
     let start = SystemTime::now();
     let deadline = Instant::now() + files::WALK_TIMEOUT;
     let stamp = racy_stamp(start, settings.coarse);
-    let file = settings.dir.join(file_name(root));
-    let env = env_key();
+    let file = settings.dir.join(file_name(root, kind));
+    let env = env_key(kind);
     let root_bytes = bytes_of(root.as_os_str()).to_vec();
 
     let held = held.filter(|cache| cache.root == root_bytes && cache.env == env);
@@ -500,7 +508,7 @@ fn refresh(root: &Path, settings: &Settings, held: Option<Cache>) -> Option<(Cac
         _ => None,
     };
 
-    let (cache, outcome) = match old.map(|old| update(root, old, stamp, deadline)) {
+    let (cache, outcome) = match old.map(|old| update(root, old, stamp, deadline, kind)) {
         Some(Update::Unchanged(cache)) => (cache, Outcome::Hit),
         Some(Update::Changed(cache, relisted, walked)) => {
             write(&file, &encode_cache(&cache));
@@ -508,7 +516,7 @@ fn refresh(root: &Path, settings: &Settings, held: Option<Cache>) -> Option<(Cac
         }
         Some(Update::Partial(cache)) => (cache, Outcome::Partial),
         Some(Update::Full) | None => {
-            let walked = full_walk(root, &root_bytes, env, stamp, deadline, settings.max_files);
+            let walked = full_walk(root, &root_bytes, env, stamp, deadline, settings.max_files, kind);
             match walked {
                 Walked::Done(cache) => {
                     write(&file, &encode_cache(&cache));
@@ -534,15 +542,23 @@ fn too_broad(root: &Path) -> bool {
             .is_some_and(|home| home == root)
 }
 
-fn file_name(root: &Path) -> String {
-    format!("{:016x}.bin", fnv1a(bytes_of(root.as_os_str())))
+fn file_name(root: &Path, kind: WalkKind) -> String {
+    let hash = fnv1a(bytes_of(root.as_os_str()));
+    match kind {
+        WalkKind::Files => format!("{hash:016x}.bin"),
+        WalkKind::Hidden => format!("{hash:016x}-hidden.bin"),
+    }
 }
 
 /// Everything outside the tree that changes what the walk reads: the
 /// variables git's config is found by, and the cwd the global excludes are
-/// matched against.
-fn env_key() -> Vec<u8> {
+/// matched against. A hidden walk's key says so too, so a cache of one walk
+/// is never taken for the other's.
+fn env_key(kind: WalkKind) -> Vec<u8> {
     let mut key = Vec::new();
+    if kind == WalkKind::Hidden {
+        key.extend_from_slice(b"walk=hidden\0");
+    }
     for name in ["HOME", "XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"] {
         key.extend_from_slice(name.as_bytes());
         match std::env::var_os(name) {
@@ -1010,9 +1026,16 @@ struct Walk {
     too_many: bool,
 }
 
-/// The walk of `starts` (folders under `root`), as list_files walks;
-/// `shallow` lists each one level down only.
-fn gather(root: &Path, starts: &[PathBuf], shallow: bool, deadline: Instant, max_files: usize) -> Walk {
+/// The walk of `starts` (folders under `root`), as `kind` walks; `shallow`
+/// lists each one level down only.
+fn gather(
+    root: &Path,
+    starts: &[PathBuf],
+    shallow: bool,
+    deadline: Instant,
+    max_files: usize,
+    kind: WalkKind,
+) -> Walk {
     let timed_out = AtomicBool::new(false);
     let too_many = AtomicBool::new(false);
     let seen = AtomicUsize::new(0);
@@ -1029,7 +1052,7 @@ fn gather(root: &Path, starts: &[PathBuf], shallow: bool, deadline: Instant, max
         out: &out,
     };
     if let Some((first, rest)) = starts.split_first() {
-        let mut builder = files::walker(first);
+        let mut builder = files::walker(first, kind);
         for start in rest {
             builder.add(start);
         }
@@ -1059,9 +1082,10 @@ fn full_walk(
     stamp: i64,
     deadline: Instant,
     max_files: usize,
+    kind: WalkKind,
 ) -> Walked {
     let sources = outer_sources(root);
-    let walk = gather(root, &[root.to_path_buf()], false, deadline, max_files);
+    let walk = gather(root, &[root.to_path_buf()], false, deadline, max_files, kind);
     if walk.too_many || walk.gathered.not_utf8 || walk.gathered.files.len() > max_files {
         return Walked::Skip(Skip {
             root: root_bytes.to_vec(),
@@ -1106,7 +1130,7 @@ fn stat_folders(root: &Path, folders: &[Folder]) -> Vec<Option<FolderStat>> {
     })
 }
 
-fn update(root: &Path, old: Cache, stamp: i64, deadline: Instant) -> Update {
+fn update(root: &Path, old: Cache, stamp: i64, deadline: Instant, kind: WalkKind) -> Update {
     // Read against the stamp of the walk that recorded them.
     let then = old.stamp;
     let marks = old.folders.iter().flat_map(|folder| folder.marks.iter());
@@ -1180,7 +1204,7 @@ fn update(root: &Path, old: Cache, stamp: i64, deadline: Instant) -> Update {
 
     // Each folder that changed, one level down.
     let paths: Vec<PathBuf> = starts.iter().map(|&at| join_rel(root, &old.folders[at].rel)).collect();
-    let shallow = gather(root, &paths, true, deadline, usize::MAX);
+    let shallow = gather(root, &paths, true, deadline, usize::MAX, kind);
     let mut timed_out = shallow.timed_out;
     if shallow.gathered.not_utf8 {
         return Update::Full;
@@ -1217,7 +1241,7 @@ fn update(root: &Path, old: Cache, stamp: i64, deadline: Instant) -> Update {
         .collect();
     fresh.sort_unstable();
     let fresh_paths: Vec<PathBuf> = fresh.iter().map(|rel| join_rel(root, rel)).collect();
-    let deep = gather(root, &fresh_paths, false, deadline, usize::MAX);
+    let deep = gather(root, &fresh_paths, false, deadline, usize::MAX, kind);
     timed_out |= deep.timed_out;
     if deep.gathered.not_utf8 {
         return Update::Full;
@@ -1576,7 +1600,7 @@ mod tests {
         }
 
         fn call(&self) -> (Vec<String>, Outcome) {
-            let (listing, outcome) = listing_with(&self.root, &self.settings).expect("cached");
+            let (listing, outcome) = listing_with(&self.root, &self.settings, WalkKind::Files).expect("cached");
             assert!(listing.complete);
             (listing.files, outcome)
         }
@@ -1619,7 +1643,7 @@ mod tests {
     }
 
     fn uncached(root: &Path) -> Vec<String> {
-        let mut files: Vec<String> = files::walker(root)
+        let mut files: Vec<String> = files::walker(root, WalkKind::Files)
             .build()
             .filter_map(|entry| files::file_of(root, entry))
             .collect();
@@ -1629,6 +1653,54 @@ mod tests {
 
     fn updated(outcome: Outcome) -> bool {
         matches!(outcome, Outcome::Updated { .. })
+    }
+
+    /// The hidden walk as an uncached walk gives it.
+    fn uncached_hidden(root: &Path) -> Vec<String> {
+        let mut files: Vec<String> = files::walker(root, WalkKind::Hidden)
+            .build()
+            .filter_map(|entry| files::file_of(root, entry))
+            .collect();
+        files::sort_js(&mut files);
+        files
+    }
+
+    #[test]
+    fn the_two_walks_are_cached_apart() {
+        let tree = Tree::new("walks");
+        fs::create_dir_all(tree.path(".git/objects")).unwrap();
+        fs::write(tree.path(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::create_dir_all(tree.path("sub")).unwrap();
+        fs::write(tree.path("sub/.git"), "gitdir: ../.git\n").unwrap();
+        fs::write(tree.path("sub/s.txt"), "s").unwrap();
+        tree.age();
+        let hidden = |tree: &Tree| {
+            let (listing, outcome) =
+                listing_with(&tree.root, &tree.settings, WalkKind::Hidden).expect("cached");
+            (listing.files, outcome)
+        };
+        // Each walk fills its own file; neither answers for the other.
+        assert_eq!(tree.check("files cold"), Outcome::Full);
+        let (found, outcome) = hidden(&tree);
+        assert_eq!(outcome, Outcome::Full);
+        assert_eq!(found, uncached_hidden(&tree.root));
+        assert!(found.contains(&".hidden/h.txt".to_owned()));
+        assert!(found.contains(&".gitignore".to_owned()));
+        assert!(!found.iter().any(|f| f.starts_with(".git/") || f.ends_with("/.git") || f.ends_with(".log")));
+        assert!(!found.iter().any(|f| f.starts_with("ignored/")));
+        assert_eq!(tree.check("files warm"), Outcome::Hit);
+        assert!(!tree.call().0.iter().any(|f| f.contains(".hidden")));
+        assert_eq!(hidden(&tree).1, Outcome::Hit);
+        assert_ne!(file_name(&tree.root, WalkKind::Files), file_name(&tree.root, WalkKind::Hidden));
+        assert_ne!(env_key(WalkKind::Files), env_key(WalkKind::Hidden));
+        // A hidden folder changed is seen by the hidden walk only.
+        fs::write(tree.path(".hidden/new.txt"), "new").unwrap();
+        let (found, outcome) = hidden(&tree);
+        assert!(updated(outcome), "{outcome:?}");
+        assert_eq!(found, uncached_hidden(&tree.root));
+        assert!(found.contains(&".hidden/new.txt".to_owned()));
+        // The files walk never went into it, so it is still a hit.
+        assert_eq!(tree.check("files after a hidden change"), Outcome::Hit);
     }
 
     #[test]
@@ -1647,7 +1719,7 @@ mod tests {
         let tree = Tree::new("ram");
         let ram = Ram::new(2);
         let call = || {
-            let (listing, outcome) = ram.listing_with(&tree.root, &tree.settings).expect("cached");
+            let (listing, outcome) = ram.listing_with(&tree.root, &tree.settings, WalkKind::Files).expect("cached");
             assert_eq!(listing.files, uncached(&tree.root), "{outcome:?}");
             outcome
         };
@@ -1661,7 +1733,7 @@ mod tests {
         assert_eq!(tree.check("after serve"), Outcome::Hit);
         // Given ahead of its check, a listing is known sound or not after.
         let ahead = || {
-            checked_meanwhile(|| ram.listing_with(&tree.root, &tree.settings).map(|(listing, _)| listing.files))
+            checked_meanwhile(|| ram.listing_with(&tree.root, &tree.settings, WalkKind::Files).map(|(listing, _)| listing.files))
         };
         let before = uncached(&tree.root);
         assert_eq!(ahead(), (Some(before.clone()), true));
@@ -1675,13 +1747,13 @@ mod tests {
         // A cancelled walk is neither kept nor written.
         fs::write(tree.root.join(".ignore"), "ignored/\nc/\n").unwrap();
         let flag = Arc::new(AtomicBool::new(true));
-        let cut = files::Cancel::scope(flag, || ram.listing_with(&tree.root, &tree.settings));
+        let cut = files::Cancel::scope(flag, || ram.listing_with(&tree.root, &tree.settings, WalkKind::Files));
         assert_eq!(cut.map(|(_, outcome)| outcome), Some(Outcome::Partial));
         assert_eq!(call(), Outcome::Full);
         // Only the roots used last are held.
         for name in ["one", "two"] {
             let other = Tree::new(&format!("ram-{name}"));
-            ram.listing_with(&other.root, &other.settings).expect("cached");
+            ram.listing_with(&other.root, &other.settings, WalkKind::Files).expect("cached");
         }
         let held = ram.roots.lock().unwrap();
         assert_eq!(held.len(), 2);
@@ -1817,7 +1889,7 @@ mod tests {
     fn a_corrupt_cache_is_a_miss() {
         let tree = Tree::new("corrupt");
         tree.check("cold");
-        let file = tree.settings.dir.join(file_name(&tree.root));
+        let file = tree.settings.dir.join(file_name(&tree.root, WalkKind::Files));
         let mut bytes = fs::read(&file).unwrap();
         let middle = bytes.len() / 2;
         bytes[middle] ^= 0x55;
@@ -1837,10 +1909,10 @@ mod tests {
     fn a_tree_too_big_is_not_cached() {
         let mut tree = Tree::new("big");
         tree.settings.max_files = 3;
-        assert!(listing_with(&tree.root, &tree.settings).is_none());
-        let file = tree.settings.dir.join(file_name(&tree.root));
+        assert!(listing_with(&tree.root, &tree.settings, WalkKind::Files).is_none());
+        let file = tree.settings.dir.join(file_name(&tree.root, WalkKind::Files));
         assert!(matches!(decode(&fs::read(&file).unwrap()), Some(Stored::Skip(_))));
-        assert!(listing_with(&tree.root, &tree.settings).is_none());
+        assert!(listing_with(&tree.root, &tree.settings, WalkKind::Files).is_none());
     }
 
     #[test]
@@ -1865,7 +1937,7 @@ mod tests {
             max_files: MAX_FILES,
             coarse: true,
         };
-        assert!(listing_with(Path::new("/"), &settings).is_none());
+        assert!(listing_with(Path::new("/"), &settings, WalkKind::Files).is_none());
         assert!(!settings.dir.exists());
     }
 

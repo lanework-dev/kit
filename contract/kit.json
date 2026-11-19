@@ -54,7 +54,7 @@
   "tools": [
     {
       "name": "find_files",
-      "description": "Fuzzy-find files by path in a folder, best match first. Respects .gitignore. Returns each file's path, score and the matched character ranges. `path` must be a folder.",
+      "description": "Fuzzy-find files by path in a folder, best match first. Respects .gitignore; in a git repository it lists hidden files too (never .git/), as an editor's quick-open does. Returns each file's path, score and the matched character ranges. `path` must be a folder.",
       "readOnly": true,
       "inputSchema": {
         "type": "object",
