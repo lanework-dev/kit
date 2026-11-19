@@ -8,6 +8,10 @@
 //! same params in-process. An error the app answered is final: running the
 //! call again would only repeat it. Every kit tool only reads, so a call
 //! run twice is harmless.
+//!
+//! `LWK_NO_SOCKET` set to anything but empty or `0` skips the socket: every
+//! call runs in-process. The app sets it when it spawns lwk per call, which
+//! would otherwise ask the app that spawned it (app -> lwk -> app).
 
 use crate::engine::types::{KitError, KitErrorCode};
 use crate::{jsonjs, paths};
@@ -56,8 +60,18 @@ fn no_answer() -> Answer {
     ))
 }
 
-/// Call `method` in the running app with `params`.
+/// Whether `LWK_NO_SOCKET` turns the socket off: set, and neither empty nor
+/// `0`.
+fn skipped(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+/// Call `method` in the running app with `params`. [`Answer::Absent`]
+/// without connecting when `LWK_NO_SOCKET` says so.
 pub fn call(method: &str, params: Map<String, Value>) -> Answer {
+    if skipped(std::env::var_os("LWK_NO_SOCKET").as_deref()) {
+        return Answer::Absent;
+    }
     let path = paths::app_home().join("run").join("kit.sock");
     if !path.exists() {
         return Answer::Absent;
@@ -125,4 +139,20 @@ pub fn call(method: &str, params: Map<String, Value>) -> Answer {
         message => jsonjs::template(message),
     };
     Answer::Failed(KitError::new(code, message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::skipped;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn no_socket_values() {
+        assert!(!skipped(None));
+        assert!(!skipped(Some(OsStr::new(""))));
+        assert!(!skipped(Some(OsStr::new("0"))));
+        assert!(skipped(Some(OsStr::new("1"))));
+        assert!(skipped(Some(OsStr::new("true"))));
+        assert!(skipped(Some(OsStr::new("00"))));
+    }
 }
