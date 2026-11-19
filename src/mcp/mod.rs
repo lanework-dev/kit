@@ -21,12 +21,24 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
 const SERVER_NAME: &str = "lanework-kit";
-const SERVER_VERSION: &str = "0.1.0";
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const LATEST_PROTOCOL_VERSION: &str = "2025-06-18";
 const KNOWN_PROTOCOL_VERSIONS: [&str; 4] =
     ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
 
-const INSTRUCTIONS: &str = "lanework-kit searches this machine's files and agent conversations: find_files (fuzzy paths), search_text (ripgrep), search_structural (ast-grep patterns), list_files and search_sessions. Every tool runs in the folder you started in, or a folder under it that you pass as `path` (`folder` is its older name); search_text and search_structural also take one file as `path`. Paths in answers are relative to the folder searched; a file searched alone is answered by its name.";
+/// What an agent is told at `initialize`. Agents search through the shell by
+/// habit (`grep -r … | head`, `cat`, `sed -n`), and some load MCP tools only
+/// on demand, so this says when to use each tool, not only what it does.
+const INSTRUCTIONS: &str = concat!(
+    "lanework-kit searches this project's files and past agent conversations. It respects .gitignore, skips binary files, and skips hidden files except in find_files, which lists them too in a git repository (never .git/). It never leaves the folder you started in and caps its answers. Prefer it to shell commands for searching:\n",
+    "- A file by (part of) its name, typos allowed: find_files (`query`), not find, fd, ls -R or `git ls-files | grep`.\n",
+    "- Text in files: search_text (`query` is literal; `regex: true` for a pattern; `case_sensitive`; `globs` such as `*.ts` or `!*.test.ts`), not grep -r, rg or git grep.\n",
+    "- Code by its shape (definitions, calls, imports, JSX): search_structural with an ast-grep `pattern` and `lang`, e.g. `useEffect($A, [])` (tsx), `def $F($$$ARGS): $$$BODY` (python), `fn $F($$$ARGS) -> $R { $$$BODY }` (rust), not a regex grep.\n",
+    "- The files under a folder: list_files, not ls -R or `find . -type f`.\n",
+    "- What an earlier Claude Code, Codex or OpenCode conversation in this project said or did: search_sessions (`query`), not grep over ~/.claude or ~/.codex.\n",
+    "Every tool runs in the folder you started in, or a folder under it passed as `path` (`folder` is its older name); search_text and search_structural also take one file as `path`. Paths in answers are relative to the folder searched; a file searched alone is answered by its name.\n",
+    "Answers are already capped (`limit` counts files, `max_lines` lines), so do not pipe them through head. Once a search gives you the file and line, read just that part with your file-reading tool (an offset and a limit), not cat, head or sed -n. If your tools load on demand, load these before your first search."
+);
 
 /// The contract, embedded.
 const CONTRACT: &str = include_str!("../../contract/kit.json");
