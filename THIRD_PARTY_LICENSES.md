@@ -33,7 +33,7 @@ A crate under several licenses (`A AND B`) has one row for each.
 | [encoding_rs](https://github.com/hsivonen/encoding_rs) | 0.8.44 | MIT |
 | [multiversion_no_op](https://github.com/hsivonen/multiversion_no_op) | 1.0.0 | MIT |
 | [neo_frizbee](https://github.com/saghen/frizbee) | 0.13.3 | MIT |
-| [lanework-kit](https://github.com/lanework-dev/kit) | 0.2.0 | MIT |
+| [lanework-kit](https://github.com/lanework-dev/kit) | 0.3.0 | MIT |
 | [ast-grep-core](https://github.com/ast-grep/ast-grep) | 0.51.3 | MIT |
 | [ast-grep-language](https://github.com/ast-grep/ast-grep) | 0.51.3 | MIT |
 | [tree-sitter-html](https://github.com/tree-sitter/tree-sitter-html) | 0.23.2 | MIT |
@@ -631,7 +631,7 @@ SOFTWARE.
 ### MIT License (`MIT`)
 
 Used by:
-- lanework-kit 0.2.0
+- lanework-kit 0.3.0
 
 ```text
 MIT License

@@ -8,6 +8,8 @@ The kit contract (`contract/kit.json`) has its own semantic version, given in ea
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-19
+
 Kit contract: **1.2.0**, unchanged (no input or answer changed shape; only the `find_files` description now mentions hidden files).
 
 ### Added
@@ -72,6 +74,7 @@ First release. Kit contract: **1.0.0**.
 - `lwk hook on|off|status`: an opt-in Claude Code hook that rewrites plain `grep -r` to `lwk grep` (off by default).
 - Releases for macOS (signed with a Developer ID, notarized) and Linux (static musl), a shell installer and a Homebrew tap.
 
-[Unreleased]: https://github.com/lanework-dev/kit/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/lanework-dev/kit/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/lanework-dev/kit/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/lanework-dev/kit/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/lanework-dev/kit/releases/tag/v0.1.0
